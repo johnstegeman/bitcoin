@@ -23,6 +23,7 @@
  *   cypher-shell < ../post_import.cypher
  */
 
+use itoa::Buffer as ItoaBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     fs::{self, File},
@@ -617,25 +618,21 @@ fn process_block(
     let block_size = block.total_size() as i64;
     let block_weight = block.weight().to_wu() as i64;
 
-    // Block node — all fields as String to keep write_record type consistent
-    w.nodes_block.write_record(vec![
-        block_hash.clone(),
-        height.to_string(),
-        prev_hash.clone(),
-        block.header.merkle_root.to_string(),
-        time_str.clone(),
-        block.txdata.len().to_string(),
-        block_size.to_string(),
-        block_weight.to_string(),
-        bits_hex,
-        format!("{:.8}", difficulty),
-        block.header.nonce.to_string(),
-        block.header.version.to_consensus().to_string(),
+    // Block node
+    let merkle_root_str = block.header.merkle_root.to_string();
+    let difficulty_str  = format!("{:.8}", difficulty);
+    let (mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) =
+        (ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new());
+    w.nodes_block.write_record(&[
+        &block_hash, b1.format(height), &prev_hash, &merkle_root_str,
+        &time_str, b2.format(block.txdata.len()), b3.format(block_size),
+        b4.format(block_weight), &bits_hex, &difficulty_str,
+        b5.format(block.header.nonce), b6.format(block.header.version.to_consensus()),
     ])?;
 
     // NEXT_BLOCK relationship (skip for genesis)
     if let Some(prev) = prev_block_hash {
-        w.rels_next_block.write_record(vec![prev.to_string(), block_hash.clone()])?;
+        w.rels_next_block.write_record(&[prev, &block_hash])?;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -661,29 +658,29 @@ fn process_block(
         // address → (outputCount, amountReceived) for BENEFITS_TO
         let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
 
+        let mut ibuf_n = ItoaBuf::new();
+        let mut ibuf_amt = ItoaBuf::new();
+        let mut ibuf_cnt = ItoaBuf::new();
+        let mut ibuf_rcv = ItoaBuf::new();
         for (n, txout) in tx.output.iter().enumerate() {
             let output_id   = format!("{}:{}", txid, n);
             let amount      = txout.value.to_sat() as i64;
             let spk         = &txout.script_pubkey;
             let script_hex  = hex::encode(spk.as_bytes());
-            let stype       = script_type(spk).to_string();
+            let stype       = script_type(spk);
             let address     = script_address(spk);
             total_output   += amount;
 
             // Output node (isSpent=false; populated by post_import.cypher)
-            w.nodes_output.write_record(vec![
-                output_id.clone(),
-                n.to_string(),
-                amount.to_string(),
-                script_hex,
-                stype,
-                "false".to_string(), String::new(), String::new(),
+            w.nodes_output.write_record(&[
+                &output_id, ibuf_n.format(n), ibuf_amt.format(amount),
+                &script_hex, stype, "false", "", "",
             ])?;
-            w.rels_has_output.write_record(vec![txid.clone(), output_id.clone()])?;
+            w.rels_has_output.write_record(&[&txid, &output_id])?;
 
             if let Some(ref addr) = address {
-                w.nodes_address.write_record(vec![addr.clone()])?;
-                w.rels_locked_to.write_record(vec![output_id.clone(), addr.clone()])?;
+                w.nodes_address.write_record(&[addr.as_str()])?;
+                w.rels_locked_to.write_record(&[&output_id, addr.as_str()])?;
                 let e = benefits.entry(addr.clone()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += amount;
@@ -695,8 +692,8 @@ fn process_block(
 
         // BENEFITS_TO – one relationship per unique recipient address per tx
         for (addr, (cnt, received)) in &benefits {
-            w.rels_benefits_to.write_record(vec![
-                txid.clone(), addr.clone(), cnt.to_string(), received.to_string(),
+            w.rels_benefits_to.write_record(&[
+                &txid, addr.as_str(), ibuf_cnt.format(*cnt), ibuf_rcv.format(*received),
             ])?;
         }
 
@@ -733,29 +730,29 @@ fn process_block(
         // address → (inputCount, amountSpent) for PERFORMS
         let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
 
+        let mut ibuf_idx = ItoaBuf::new();
+        let mut ibuf_seq = ItoaBuf::new();
+        let mut ibuf_pvout = ItoaBuf::new();
         for (idx, txin) in tx.input.iter().enumerate() {
             let input_id       = format!("{}:{}", txid, idx);
             let sequence       = txin.sequence.0 as i64;
             let witness        = encode_witness(&txin.witness);
             let script_sig_hex = hex::encode(txin.script_sig.as_bytes());
 
-            w.nodes_input.write_record(vec![
-                input_id.clone(),
-                idx.to_string(),
-                script_sig_hex,
-                sequence.to_string(),
-                witness,
+            w.nodes_input.write_record(&[
+                &input_id, ibuf_idx.format(idx), &script_sig_hex,
+                ibuf_seq.format(sequence), &witness,
             ])?;
-            w.rels_has_input.write_record(vec![txid.clone(), input_id.clone()])?;
+            w.rels_has_input.write_record(&[&txid, &input_id])?;
             t.n_inputs += 1;
 
             if !is_coinbase {
                 let prev_txid   = &txin.previous_output.txid; // &bitcoin::Txid
                 let prev_vout   = txin.previous_output.vout;
-                let prev_out_id = format!("{}:{}", prev_txid, prev_vout);
+                let prev_out_id = format!("{}:{}", prev_txid, ibuf_pvout.format(prev_vout));
                 let prev_bytes  = *prev_txid.as_byte_array(); // [u8; 32], no alloc
 
-                w.rels_spends.write_record(vec![input_id, prev_out_id])?;
+                w.rels_spends.write_record(&[&input_id, &prev_out_id])?;
 
                 match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
@@ -790,27 +787,25 @@ fn process_block(
         let tx_weight = tx.weight().to_wu() as i64;
 
         // Transaction node
-        w.nodes_transaction.write_record(vec![
-            txid.clone(),
-            height.to_string(),
-            block_hash.clone(),
-            time_str.clone(),
-            total_input.to_string(),
-            total_output.to_string(),
-            fee.to_string(),
-            tx_size.to_string(),
-            tx_vsize.to_string(),
-            tx_weight.to_string(),
-            tx.version.0.to_string(),
-            tx.lock_time.to_consensus_u32().to_string(),
-            (if is_coinbase { "true" } else { "false" }).to_string(),
+        let (mut tb1, mut tb2, mut tb3, mut tb4, mut tb5, mut tb6, mut tb7, mut tb8, mut tb9) =
+            (ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(),
+             ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new());
+        let coinbase_str = if is_coinbase { "true" } else { "false" };
+        w.nodes_transaction.write_record(&[
+            txid.as_str(), tb1.format(height), block_hash.as_str(), time_str.as_str(),
+            tb2.format(total_input), tb3.format(*total_output), tb4.format(fee),
+            tb5.format(tx_size), tb6.format(tx_vsize), tb7.format(tx_weight),
+            tb8.format(tx.version.0), tb9.format(tx.lock_time.to_consensus_u32()),
+            coinbase_str,
         ])?;
-        w.rels_included_in.write_record(vec![txid.clone(), block_hash.clone()])?;
+        w.rels_included_in.write_record(&[&txid, &block_hash])?;
 
         // PERFORMS – one relationship per unique sender address per tx
+        let mut ibuf_cnt = ItoaBuf::new();
+        let mut ibuf_spt = ItoaBuf::new();
         for (addr, (cnt, spent)) in &performs {
-            w.rels_performs.write_record(vec![
-                addr.clone(), txid.clone(), cnt.to_string(), spent.to_string(),
+            w.rels_performs.write_record(&[
+                addr.as_str(), &txid, ibuf_cnt.format(*cnt), ibuf_spt.format(*spent),
             ])?;
         }
     }
