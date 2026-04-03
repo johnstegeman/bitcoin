@@ -173,7 +173,10 @@ fn bits_to_difficulty(bits: u32) -> f64 {
 
 fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=17179869184;")?;
+    // synchronous=OFF: no fsyncs. This is exported/re-computable data so crash-safety
+    // is not required. Eliminates the two fsyncs per commit cycle (WAL + main DB)
+    // that were causing 30+ second stalls on spinning disk.
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=17179869184;")?;
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS block_idx (
             hash        TEXT NOT NULL PRIMARY KEY,
@@ -981,27 +984,41 @@ fn main() -> Result<()> {
             // Inserting/deleting in key order means consecutive operations hit the same
             // or adjacent leaf pages → dramatically better page-cache hit rate and
             // fewer random I/Os vs the random order from HashMap drain().
+            let mut inserts: Vec<_> = pending_inserts.drain().collect();
+            inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let t_ins0 = Instant::now();
             {
-                let mut inserts: Vec<_> = pending_inserts.drain().collect();
-                inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 let mut ins = db.prepare(
                     "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
                 )?;
                 for ((txid_bytes, vout), (amount, addr)) in inserts {
                     ins.execute(params![txid_bytes.as_slice(), vout, amount, addr])?;
                 }
+            }
+            let t_ins_ms = t_ins0.elapsed().as_secs_f64() * 1000.0;
 
-                let mut deletes: Vec<_> = pending_deletes.drain().collect();
-                deletes.sort_unstable();
+            let mut deletes: Vec<_> = pending_deletes.drain().collect();
+            deletes.sort_unstable();
+            let t_del0 = Instant::now();
+            {
                 let mut del = db.prepare("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
                 for (txid_bytes, vout) in deletes {
                     del.execute(params![txid_bytes.as_slice(), vout])?;
                 }
             }
+            let t_del_ms = t_del0.elapsed().as_secs_f64() * 1000.0;
+
+            let t_commit0 = Instant::now();
             db.execute("COMMIT", [])?;
+            let t_commit_ms = t_commit0.elapsed().as_secs_f64() * 1000.0;
+
+            let t_ckpt0 = Instant::now();
             db.execute_batch("PRAGMA wal_checkpoint(RESTART)")?;
+            let t_ckpt_ms = t_ckpt0.elapsed().as_secs_f64() * 1000.0;
+
             w.flush_all()?;
             timings.commit += t0.elapsed();
+            println!("    [commit @{height}] ins={t_ins_ms:.0}ms del={t_del_ms:.0}ms commit={t_commit_ms:.0}ms ckpt={t_ckpt_ms:.0}ms");
             if height < end {
                 db.execute("BEGIN", [])?;
             }
