@@ -349,7 +349,7 @@ fn open_writer(path: &Path, append: bool) -> Result<csv::Writer<BufWriter<File>>
         .append(append)
         .truncate(!append)
         .open(path)?;
-    let buf = BufWriter::with_capacity(1 << 20, file); // 1 MB write buffer
+    let buf = BufWriter::with_capacity(1 << 23, file); // 8 MB write buffer
     Ok(csv::WriterBuilder::new()
         .has_headers(false)
         .from_writer(buf))
@@ -906,8 +906,10 @@ fn main() -> Result<()> {
          FROM block_idx WHERE height = ?1"
     )?;
 
-    const COMMIT_EVERY: i64 = 2000; // SQLite commit + CSV flush interval (blocks)
-    const LOG_EVERY: i64    = 1000;
+    const COMMIT_EVERY: i64    = 2000; // SQLite commit + CSV flush interval (blocks)
+    const CHECKPOINT_EVERY: i64 = 5;   // WAL checkpoint every N commits
+    const LOG_EVERY: i64        = 1000;
+    let mut commit_count: i64   = 0;
 
     db.execute("BEGIN", [])?;
     let mut prev_block_hash: Option<String> = if start > 0 {
@@ -1020,13 +1022,17 @@ fn main() -> Result<()> {
             db.execute("COMMIT", [])?;
             let t_commit_ms = t_commit0.elapsed().as_secs_f64() * 1000.0;
 
+            commit_count += 1;
             let t_ckpt0 = Instant::now();
-            db.execute_batch("PRAGMA wal_checkpoint(RESTART)")?;
+            let did_ckpt = commit_count % CHECKPOINT_EVERY == 0 || height == end;
+            if did_ckpt {
+                db.execute_batch("PRAGMA wal_checkpoint(RESTART)")?;
+            }
             let t_ckpt_ms = t_ckpt0.elapsed().as_secs_f64() * 1000.0;
 
             w.flush_all()?;
             timings.commit += t0.elapsed();
-            println!("    [commit @{height}] ins={t_ins_ms:.0}ms del={t_del_ms:.0}ms commit={t_commit_ms:.0}ms ckpt={t_ckpt_ms:.0}ms");
+            println!("    [commit @{height}] ins={t_ins_ms:.0}ms del={t_del_ms:.0}ms commit={t_commit_ms:.0}ms ckpt={t_ckpt_ms:.0}ms{}", if did_ckpt { "" } else { " (no ckpt)" });
             if height < end {
                 db.execute("BEGIN", [])?;
             }
