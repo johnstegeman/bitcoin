@@ -209,6 +209,10 @@ fn open_db(path: &Path) -> Result<Connection> {
         );
         INSERT OR IGNORE INTO checkpoint (id, phase, last_height) VALUES (1, 'index', -1);
     ")?;
+    // Temp table for batched UTXO deletes: populated at each commit, then joined
+    // against utxo in a single DELETE ... WHERE EXISTS query rather than N individual
+    // point-deletes. Lives in memory (PRAGMA temp_store=MEMORY).
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS del_batch (txid BLOB NOT NULL, vout INTEGER NOT NULL)")?;
     Ok(conn)
 }
 
@@ -1000,10 +1004,15 @@ fn main() -> Result<()> {
             deletes.sort_unstable();
             let t_del0 = Instant::now();
             {
-                let mut del = db.prepare("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
-                for (txid_bytes, vout) in deletes {
-                    del.execute(params![txid_bytes.as_slice(), vout])?;
+                let mut ins = db.prepare("INSERT INTO del_batch VALUES (?1,?2)")?;
+                for (txid_bytes, vout) in &deletes {
+                    ins.execute(params![txid_bytes.as_slice(), *vout])?;
                 }
+                db.execute(
+                    "DELETE FROM utxo WHERE EXISTS (SELECT 1 FROM del_batch WHERE del_batch.txid=utxo.txid AND del_batch.vout=utxo.vout)",
+                    [],
+                )?;
+                db.execute("DELETE FROM del_batch", [])?;
             }
             let t_del_ms = t_del0.elapsed().as_secs_f64() * 1000.0;
 
