@@ -628,39 +628,53 @@ fn process_block(
     let mut utxo_inserts: Vec<([u8; 32], u32, i64, Option<String>)> =
         Vec::with_capacity(block.txdata.len() * 2);
 
+    // Reusable per-block buffers — avoids one heap allocation per output.
+    let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
+    let mut output_id    = String::with_capacity(80);  // txid(64) + ':' + vout
+    let mut script_hex_buf: Vec<u8> = Vec::with_capacity(202); // 101-byte script * 2
+    let mut ibuf_n   = ItoaBuf::new();
+    let mut ibuf_amt = ItoaBuf::new();
+    let mut ibuf_cnt = ItoaBuf::new();
+    let mut ibuf_rcv = ItoaBuf::new();
+
     let t0 = Instant::now();
     for tx in &block.txdata {
-        let txid_obj  = tx.compute_txid();
-        let txid      = txid_obj.to_string();      // hex string – for CSV
-        let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for SQLite/cache
+        let txid_obj   = tx.compute_txid();
+        let txid       = txid_obj.to_string();      // hex string – for CSV
+        let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for cache
         let mut total_output: i64 = 0;
 
-        // address → (outputCount, amountReceived) for BENEFITS_TO
-        let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
+        benefits.clear();
 
-        let mut ibuf_n = ItoaBuf::new();
-        let mut ibuf_amt = ItoaBuf::new();
-        let mut ibuf_cnt = ItoaBuf::new();
-        let mut ibuf_rcv = ItoaBuf::new();
         for (n, txout) in tx.output.iter().enumerate() {
-            let output_id   = format!("{}:{}", txid, n);
-            let amount      = txout.value.to_sat() as i64;
-            let spk         = &txout.script_pubkey;
-            let script_hex  = hex::encode(spk.as_bytes());
-            let stype       = script_type(spk);
-            let address     = script_address(spk);
-            total_output   += amount;
+            let amount = txout.value.to_sat() as i64;
+            let spk    = &txout.script_pubkey;
+            let stype  = script_type(spk);
+            let address = script_address(spk);
+            total_output += amount;
+
+            // Build output_id in place: txid + ':' + n
+            output_id.clear();
+            output_id.push_str(&txid);
+            output_id.push(':');
+            output_id.push_str(ibuf_n.format(n));
+
+            // Hex-encode script into reusable buffer (no allocation)
+            let spk_bytes = spk.as_bytes();
+            script_hex_buf.resize(spk_bytes.len() * 2, 0);
+            hex::encode_to_slice(spk_bytes, &mut script_hex_buf).unwrap();
 
             // Output node (isSpent=false; populated by post_import.cypher)
             w.nodes_output.write_record(&[
-                &output_id, ibuf_n.format(n), ibuf_amt.format(amount),
-                &script_hex, stype, "false", "", "",
+                output_id.as_bytes(), ibuf_n.format(n).as_bytes(),
+                ibuf_amt.format(amount).as_bytes(),
+                &script_hex_buf, stype.as_bytes(), b"false", b"", b"",
             ])?;
-            w.rels_has_output.write_record(&[&txid, &output_id])?;
+            w.rels_has_output.write_record(&[txid.as_bytes(), output_id.as_bytes()])?;
 
             if let Some(ref addr) = address {
-                w.nodes_address.write_record(&[addr.as_str()])?;
-                w.rels_locked_to.write_record(&[&output_id, addr.as_str()])?;
+                w.nodes_address.write_record(&[addr.as_bytes()])?;
+                w.rels_locked_to.write_record(&[output_id.as_bytes(), addr.as_bytes()])?;
                 let e = benefits.entry(addr.clone()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += amount;
@@ -673,7 +687,8 @@ fn process_block(
         // BENEFITS_TO – one relationship per unique recipient address per tx
         for (addr, (cnt, received)) in &benefits {
             w.rels_benefits_to.write_record(&[
-                &txid, addr.as_str(), ibuf_cnt.format(*cnt), ibuf_rcv.format(*received),
+                txid.as_bytes(), addr.as_bytes(),
+                ibuf_cnt.format(*cnt).as_bytes(), ibuf_rcv.format(*received).as_bytes(),
             ])?;
         }
 
