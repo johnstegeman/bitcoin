@@ -28,6 +28,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -317,6 +318,64 @@ impl Writers {
     }
 }
 
+// ─── Performance counters ─────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Timings {
+    read:         Duration, // read_raw_block (file I/O)
+    decode:       Duration, // consensus_decode
+    pass1_csv:    Duration, // pass 1: output/address CSV writes
+    utxo_insert:  Duration, // batch UTXO inserts to SQLite
+    utxo_lookup:  Duration, // per-input UTXO SELECT in pass 2
+    pass2_csv:    Duration, // pass 2: input/tx CSV writes (excl. lookup)
+    utxo_delete:  Duration, // batch UTXO deletes from SQLite
+    commit:       Duration, // SQLite COMMIT + CSV flush
+    checkpoint:   Duration, // UPDATE checkpoint row
+    n_blocks:     u64,
+    n_inputs:     u64,
+    n_outputs:    u64,
+}
+
+impl Timings {
+    fn print_report(&self, height: i64) {
+        let total = self.read + self.decode + self.pass1_csv + self.utxo_insert
+                  + self.utxo_lookup + self.pass2_csv + self.utxo_delete
+                  + self.commit + self.checkpoint;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let pct = |d: Duration| if total.is_zero() { 0.0 } else { d.as_secs_f64() / total.as_secs_f64() * 100.0 };
+        let n = self.n_blocks.max(1);
+        println!(
+            "  [perf @{height}] {:.0}ms/block over {} blocks  ({} inputs, {} outputs)",
+            ms(total) / n as f64, n, self.n_inputs, self.n_outputs,
+        );
+        println!(
+            "    read       {:>8.1}ms {:>5.1}%   decode     {:>8.1}ms {:>5.1}%",
+            ms(self.read),   pct(self.read),
+            ms(self.decode), pct(self.decode),
+        );
+        println!(
+            "    pass1_csv  {:>8.1}ms {:>5.1}%   utxo_ins   {:>8.1}ms {:>5.1}%",
+            ms(self.pass1_csv),   pct(self.pass1_csv),
+            ms(self.utxo_insert), pct(self.utxo_insert),
+        );
+        println!(
+            "    utxo_look  {:>8.1}ms {:>5.1}%   pass2_csv  {:>8.1}ms {:>5.1}%",
+            ms(self.utxo_lookup), pct(self.utxo_lookup),
+            ms(self.pass2_csv),   pct(self.pass2_csv),
+        );
+        println!(
+            "    utxo_del   {:>8.1}ms {:>5.1}%   commit     {:>8.1}ms {:>5.1}%   checkpoint {:>8.1}ms {:>5.1}%",
+            ms(self.utxo_delete), pct(self.utxo_delete),
+            ms(self.commit),      pct(self.commit),
+            ms(self.checkpoint),  pct(self.checkpoint),
+        );
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 // ─── Phase 1: Block file indexing ─────────────────────────────────────────────
 
 /// Scan all blk*.dat files and populate block_idx in SQLite.
@@ -475,6 +534,7 @@ fn process_block(
     prev_block_hash: Option<&str>,
     w: &mut Writers,
     db: &Connection,
+    t: &mut Timings,
 ) -> Result<()> {
     let block_hash = block.header.block_hash().to_string();
     let prev_hash  = block.header.prev_blockhash.to_string();
@@ -519,6 +579,7 @@ fn process_block(
     let mut utxo_inserts: Vec<(String, u32, i64, Option<String>)> =
         Vec::with_capacity(block.txdata.len() * 2);
 
+    let t0 = Instant::now();
     for tx in &block.txdata {
         let txid = tx.compute_txid().to_string();
         let mut total_output: i64 = 0;
@@ -555,6 +616,7 @@ fn process_block(
             }
 
             utxo_inserts.push((txid.clone(), n as u32, amount, address));
+            t.n_outputs += 1;
         }
 
         // BENEFITS_TO – one relationship per unique recipient address per tx
@@ -566,9 +628,11 @@ fn process_block(
 
         tx_totals.push((txid, total_output));
     }
+    t.pass1_csv += t0.elapsed();
 
     // Batch-insert all outputs from this block into the UTXO cache.
     // Must complete before Pass 2 reads from it (same SQLite connection = visible).
+    let t0 = Instant::now();
     {
         let mut ins = db.prepare_cached(
             "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
@@ -577,6 +641,7 @@ fn process_block(
             ins.execute(params![txid, *vout, *amount, addr])?;
         }
     }
+    t.utxo_insert += t0.elapsed();
 
     // ─────────────────────────────────────────────────────────────────────
     // PASS 2: inputs — look up spent UTXOs, compute fees, write Transaction
@@ -589,6 +654,8 @@ fn process_block(
         "SELECT amount, address FROM utxo WHERE txid=?1 AND vout=?2"
     )?;
 
+    let t0 = Instant::now();
+    let mut lookup_in_block = Duration::ZERO;
     for (tx, (txid, total_output)) in block.txdata.iter().zip(tx_totals.iter()) {
         let is_coinbase = tx.is_coinbase();
         let mut total_input: i64 = 0;
@@ -610,6 +677,7 @@ fn process_block(
                 witness,
             ])?;
             w.rels_has_input.write_record(vec![txid.clone(), input_id.clone()])?;
+            t.n_inputs += 1;
 
             if !is_coinbase {
                 let prev_txid   = txin.previous_output.txid.to_string();
@@ -619,9 +687,15 @@ fn process_block(
                 w.rels_spends.write_record(vec![input_id, prev_out_id])?;
 
                 // Look up spent UTXO for amount and sender address
-                match lookup.query_row(params![&prev_txid, prev_vout], |r| {
+                let tl = Instant::now();
+                let result = lookup.query_row(params![&prev_txid, prev_vout], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-                }).optional()? {
+                }).optional()?;
+                let elapsed = tl.elapsed();
+                t.utxo_lookup += elapsed;
+                lookup_in_block += elapsed;
+
+                match result {
                     Some((amt, addr)) => {
                         total_input += amt;
                         if let Some(a) = addr {
@@ -678,9 +752,11 @@ fn process_block(
             ])?;
         }
     }
+    t.pass2_csv += t0.elapsed() - lookup_in_block;
 
     // Delete spent UTXOs from cache via a temp table batch delete.
     // One DELETE JOIN is far faster than N individual DELETEs at scale.
+    let t0 = Instant::now();
     if !utxo_deletes.is_empty() {
         db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _del (txid TEXT, vout INTEGER)")?;
         db.execute("DELETE FROM _del", [])?;
@@ -692,7 +768,9 @@ fn process_block(
         }
         db.execute_batch("DELETE FROM utxo WHERE (txid,vout) IN (SELECT txid,vout FROM _del)")?;
     }
+    t.utxo_delete += t0.elapsed();
 
+    t.n_blocks += 1;
     Ok(())
 }
 
@@ -783,6 +861,7 @@ fn main() -> Result<()> {
 
     let total = (end - start + 1).max(1);
     let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut timings = Timings::default();
 
     for height in start..=end {
         let (file_path, byte_offset, block_size, hash): (String, i64, i64, String) =
@@ -790,20 +869,29 @@ fn main() -> Result<()> {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             }).with_context(|| format!("block at height {height} not found in index"))?;
 
+        let t0 = Instant::now();
         let raw = read_raw_block(&file_path, byte_offset, block_size, &mut file_cache)
             .with_context(|| format!("reading block {height} from {file_path}"))?;
+        timings.read += t0.elapsed();
 
+        let t0 = Instant::now();
         let block = Block::consensus_decode(&mut std::io::Cursor::new(&raw))
             .with_context(|| format!("decoding block {height}"))?;
+        timings.decode += t0.elapsed();
 
-        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &db)?;
+        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &db, &mut timings)?;
 
+        let t0 = Instant::now();
         db.execute("UPDATE checkpoint SET last_height=?1 WHERE id=1", params![height])?;
+        timings.checkpoint += t0.elapsed();
+
         prev_block_hash = Some(hash);
 
         if height % COMMIT_EVERY == 0 || height == end {
+            let t0 = Instant::now();
             db.execute("COMMIT", [])?;
             w.flush_all()?;
+            timings.commit += t0.elapsed();
             if height < end {
                 db.execute("BEGIN", [])?;
             }
@@ -812,6 +900,8 @@ fn main() -> Result<()> {
         if height % LOG_EVERY == 0 || height == end {
             let done = (height - start + 1) as f64 / total as f64 * 100.0;
             println!("  block {:>9} / {}  ({:.1}%)", height, end, done);
+            timings.print_report(height);
+            timings.reset();
         }
     }
 
