@@ -33,7 +33,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use bitcoin::{
     block::Header as BlockHeader,
-    consensus::{serialize, Decodable},
+    consensus::Decodable,
     script::Instruction,
     Address, Block, Network, PublicKey,
 };
@@ -171,7 +171,7 @@ fn bits_to_difficulty(bits: u32) -> f64 {
 
 fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=17179869184;")?;
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS block_idx (
             hash        TEXT NOT NULL PRIMARY KEY,
@@ -445,9 +445,21 @@ fn assign_heights(db: &Connection) -> Result<()> {
 // ─── Phase 2: Block processing ────────────────────────────────────────────────
 
 /// Read raw block bytes from a .blk file at the stored offset.
-fn read_raw_block(file_path: &str, byte_offset: i64, block_size: i64) -> Result<Vec<u8>> {
-    let mut f = File::open(file_path)
-        .with_context(|| format!("open {file_path}"))?;
+/// Takes a cache of open file handles to avoid reopening on every call.
+fn read_raw_block(
+    file_path: &str,
+    byte_offset: i64,
+    block_size: i64,
+    file_cache: &mut HashMap<String, File>,
+) -> Result<Vec<u8>> {
+    let f = if let Some(f) = file_cache.get_mut(file_path) {
+        f
+    } else {
+        let f = File::open(file_path)
+            .with_context(|| format!("open {file_path}"))?;
+        file_cache.insert(file_path.to_string(), f);
+        file_cache.get_mut(file_path).unwrap()
+    };
     f.seek(SeekFrom::Start(byte_offset as u64))?;
     let mut buf = vec![0u8; block_size as usize];
     f.read_exact(&mut buf)?;
@@ -637,7 +649,7 @@ fn process_block(
 
         // Transaction total size = serialized byte length (includes witness data).
         // vsize and weight are cheaper to compute from the parsed struct.
-        let tx_size   = serialize(tx).len() as i64;
+        let tx_size   = tx.total_size() as i64;
         let tx_vsize  = tx.vsize() as i64;
         let tx_weight = tx.weight().to_wu() as i64;
 
@@ -667,14 +679,18 @@ fn process_block(
         }
     }
 
-    // Delete spent UTXOs from cache (keeps DB at roughly current UTXO set size)
-    {
-        let mut del = db.prepare_cached(
-            "DELETE FROM utxo WHERE txid=?1 AND vout=?2"
-        )?;
-        for (txid, vout) in &utxo_deletes {
-            del.execute(params![txid, *vout])?;
+    // Delete spent UTXOs from cache via a temp table batch delete.
+    // One DELETE JOIN is far faster than N individual DELETEs at scale.
+    if !utxo_deletes.is_empty() {
+        db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _del (txid TEXT, vout INTEGER)")?;
+        db.execute("DELETE FROM _del", [])?;
+        {
+            let mut ins = db.prepare_cached("INSERT INTO _del VALUES (?1,?2)")?;
+            for (txid, vout) in &utxo_deletes {
+                ins.execute(params![txid, *vout])?;
+            }
         }
+        db.execute_batch("DELETE FROM utxo WHERE (txid,vout) IN (SELECT txid,vout FROM _del)")?;
     }
 
     Ok(())
@@ -751,7 +767,7 @@ fn main() -> Result<()> {
          FROM block_idx WHERE height = ?1"
     )?;
 
-    const COMMIT_EVERY: i64 = 200; // SQLite commit + CSV flush interval (blocks)
+    const COMMIT_EVERY: i64 = 2000; // SQLite commit + CSV flush interval (blocks)
     const LOG_EVERY: i64    = 1000;
 
     db.execute("BEGIN", [])?;
@@ -766,6 +782,7 @@ fn main() -> Result<()> {
     };
 
     let total = (end - start + 1).max(1);
+    let mut file_cache: HashMap<String, File> = HashMap::new();
 
     for height in start..=end {
         let (file_path, byte_offset, block_size, hash): (String, i64, i64, String) =
@@ -773,7 +790,7 @@ fn main() -> Result<()> {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             }).with_context(|| format!("block at height {height} not found in index"))?;
 
-        let raw = read_raw_block(&file_path, byte_offset, block_size)
+        let raw = read_raw_block(&file_path, byte_offset, block_size, &mut file_cache)
             .with_context(|| format!("reading block {height} from {file_path}"))?;
 
         let block = Block::consensus_decode(&mut std::io::Cursor::new(&raw))
