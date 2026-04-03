@@ -212,7 +212,7 @@ fn open_db(path: &Path) -> Result<Connection> {
     // Temp table for batched UTXO deletes: populated at each commit, then joined
     // against utxo in a single DELETE ... WHERE EXISTS query rather than N individual
     // point-deletes. Lives in memory (PRAGMA temp_store=MEMORY).
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS del_batch (txid BLOB NOT NULL, vout INTEGER NOT NULL)")?;
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS del_batch (txid BLOB NOT NULL, vout INTEGER NOT NULL, PRIMARY KEY (txid, vout)) WITHOUT ROWID")?;
     Ok(conn)
 }
 
