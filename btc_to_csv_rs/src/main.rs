@@ -35,6 +35,7 @@ use anyhow::{bail, Context, Result};
 use bitcoin::{
     block::Header as BlockHeader,
     consensus::Decodable,
+    hashes::Hash,
     script::Instruction,
     Address, Block, Network, PublicKey,
 };
@@ -186,7 +187,7 @@ fn open_db(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_block_idx_height ON block_idx(height);
 
         CREATE TABLE IF NOT EXISTS utxo (
-            txid    TEXT    NOT NULL,
+            txid    BLOB    NOT NULL,   -- 32 raw bytes (bitcoin::Txid::to_byte_array)
             vout    INTEGER NOT NULL,
             amount  INTEGER NOT NULL,
             address TEXT,
@@ -201,6 +202,68 @@ fn open_db(path: &Path) -> Result<Connection> {
         INSERT OR IGNORE INTO checkpoint (id, phase, last_height) VALUES (1, 'index', -1);
     ")?;
     Ok(conn)
+}
+
+/// One-time migration: if the utxo table still has TEXT txids (old schema),
+/// convert to 32-byte BLOB. BLOB keys are 2-3x faster for B-tree operations
+/// (shorter comparisons, higher fan-out, smaller pages, better cache usage).
+fn migrate_utxo_if_needed(db: &Connection) -> Result<()> {
+    let txid_type: String = db.query_row(
+        "SELECT type FROM pragma_table_info('utxo') WHERE name='txid'",
+        [], |r| r.get(0),
+    ).unwrap_or_default();
+
+    if !txid_type.eq_ignore_ascii_case("text") {
+        return Ok(());
+    }
+
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM utxo", [], |r| r.get(0))?;
+    if count == 0 {
+        db.execute_batch("
+            DROP TABLE utxo;
+            CREATE TABLE utxo (
+                txid    BLOB    NOT NULL,
+                vout    INTEGER NOT NULL,
+                amount  INTEGER NOT NULL,
+                address TEXT,
+                PRIMARY KEY (txid, vout)
+            ) WITHOUT ROWID;
+        ")?;
+        return Ok(());
+    }
+
+    println!("  Migrating {} UTXO rows from TEXT to BLOB txids (one-time)...", count);
+    db.execute_batch("
+        CREATE TABLE utxo_new (
+            txid    BLOB    NOT NULL,
+            vout    INTEGER NOT NULL,
+            amount  INTEGER NOT NULL,
+            address TEXT,
+            PRIMARY KEY (txid, vout)
+        ) WITHOUT ROWID;
+    ")?;
+    db.execute("BEGIN", [])?;
+    {
+        let mut sel = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
+        let mut ins = db.prepare("INSERT INTO utxo_new VALUES (?1,?2,?3,?4)")?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let txid_hex: String = row.get(0)?;
+            let txid: bitcoin::Txid = txid_hex.parse()
+                .with_context(|| format!("parse txid {txid_hex}"))?;
+            let txid_bytes = *txid.as_byte_array();
+            ins.execute(params![txid_bytes.as_slice(),
+                row.get::<_, u32>(1)?, row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?])?;
+        }
+    }
+    db.execute("COMMIT", [])?;
+    db.execute_batch("
+        DROP TABLE utxo;
+        ALTER TABLE utxo_new RENAME TO utxo;
+    ")?;
+    println!("  Migration complete.");
+    Ok(())
 }
 
 // ─── Header files ─────────────────────────────────────────────────────────────
@@ -534,7 +597,7 @@ fn process_block(
     prev_block_hash: Option<&str>,
     w: &mut Writers,
     db: &Connection,
-    utxo_cache: &mut HashMap<(String, u32), (i64, Option<String>)>,
+    utxo_cache: &mut HashMap<([u8; 32], u32), (i64, Option<String>)>,
     t: &mut Timings,
 ) -> Result<()> {
     let block_hash = block.header.block_hash().to_string();
@@ -577,12 +640,14 @@ fn process_block(
     // (txid, total_output) carried forward to Pass 2
     let mut tx_totals: Vec<(String, i64)> = Vec::with_capacity(block.txdata.len());
 
-    let mut utxo_inserts: Vec<(String, u32, i64, Option<String>)> =
+    let mut utxo_inserts: Vec<([u8; 32], u32, i64, Option<String>)> =
         Vec::with_capacity(block.txdata.len() * 2);
 
     let t0 = Instant::now();
     for tx in &block.txdata {
-        let txid = tx.compute_txid().to_string();
+        let txid_obj  = tx.compute_txid();
+        let txid      = txid_obj.to_string();      // hex string – for CSV
+        let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for SQLite/cache
         let mut total_output: i64 = 0;
 
         // address → (outputCount, amountReceived) for BENEFITS_TO
@@ -616,7 +681,7 @@ fn process_block(
                 e.1 += amount;
             }
 
-            utxo_inserts.push((txid.clone(), n as u32, amount, address));
+            utxo_inserts.push((txid_bytes, n as u32, amount, address));
             t.n_outputs += 1;
         }
 
@@ -638,9 +703,9 @@ fn process_block(
         let mut ins = db.prepare_cached(
             "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
         )?;
-        for (txid, vout, amount, addr) in &utxo_inserts {
-            ins.execute(params![txid, *vout, *amount, addr])?;
-            utxo_cache.insert((txid.clone(), *vout), (*amount, addr.clone()));
+        for (txid_bytes, vout, amount, addr) in &utxo_inserts {
+            ins.execute(params![txid_bytes.as_slice(), *vout, *amount, addr])?;
+            utxo_cache.insert((*txid_bytes, *vout), (*amount, addr.clone()));
         }
     }
     t.utxo_insert += t0.elapsed();
@@ -653,7 +718,7 @@ fn process_block(
     //         nodes, Input nodes, and PERFORMS/SPENDS relationships.
     // ─────────────────────────────────────────────────────────────────────
 
-    let mut utxo_deletes: Vec<(String, u32)> = Vec::new();
+    let mut utxo_deletes: Vec<([u8; 32], u32)> = Vec::new();
 
     let t0 = Instant::now();
     for (tx, (txid, total_output)) in block.txdata.iter().zip(tx_totals.iter()) {
@@ -680,13 +745,14 @@ fn process_block(
             t.n_inputs += 1;
 
             if !is_coinbase {
-                let prev_txid   = txin.previous_output.txid.to_string();
+                let prev_txid   = &txin.previous_output.txid; // &bitcoin::Txid
                 let prev_vout   = txin.previous_output.vout;
                 let prev_out_id = format!("{}:{}", prev_txid, prev_vout);
+                let prev_bytes  = *prev_txid.as_byte_array(); // [u8; 32], no alloc
 
                 w.rels_spends.write_record(vec![input_id, prev_out_id])?;
 
-                match utxo_cache.get(&(prev_txid.clone(), prev_vout)) {
+                match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
                         total_input += amt;
                         if let Some(a) = addr {
@@ -697,11 +763,11 @@ fn process_block(
                     }
                     None => {
                         // Expected only when --start > 0 (missing genesis UTXO history)
-                        eprintln!("  WARN block {height}: UTXO not found {prev_txid}:{prev_vout}");
+                        eprintln!("  WARN block {height}: UTXO not found {}:{}", prev_txid, prev_vout);
                     }
                 }
 
-                utxo_deletes.push((prev_txid, prev_vout));
+                utxo_deletes.push((prev_bytes, prev_vout));
             }
         }
 
@@ -751,9 +817,9 @@ fn process_block(
     let t0 = Instant::now();
     {
         let mut del = db.prepare_cached("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
-        for (txid, vout) in utxo_deletes.drain(..) {
-            del.execute(params![&txid, vout])?;
-            utxo_cache.remove(&(txid, vout));
+        for (txid_bytes, vout) in utxo_deletes.drain(..) {
+            del.execute(params![txid_bytes.as_slice(), vout])?;
+            utxo_cache.remove(&(txid_bytes, vout));
         }
     }
     t.utxo_delete += t0.elapsed();
@@ -773,6 +839,7 @@ fn main() -> Result<()> {
 
     let db_path = output_dir.join("utxo_cache.db");
     let db = open_db(&db_path)?;
+    migrate_utxo_if_needed(&db)?;
 
     // ── Phase 1: build block index ────────────────────────────────────────
     let phase: String = db.query_row(
@@ -851,13 +918,16 @@ fn main() -> Result<()> {
     // without any SQLite round-trips. SQLite remains the source of truth for
     // persistence; the cache is just a mirror kept in sync during processing.
     print!("  Loading UTXO cache from SQLite... ");
-    let mut utxo_cache: HashMap<(String, u32), (i64, Option<String>)> = HashMap::new();
+    let mut utxo_cache: HashMap<([u8; 32], u32), (i64, Option<String>)> = HashMap::new();
     {
         let mut stmt = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
+            let blob: Vec<u8> = row.get(0)?;
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&blob);
             utxo_cache.insert(
-                (row.get(0)?, row.get::<_, u32>(1)?),
+                (key, row.get::<_, u32>(1)?),
                 (row.get(2)?, row.get(3)?),
             );
         }
