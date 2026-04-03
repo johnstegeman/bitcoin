@@ -173,10 +173,14 @@ fn bits_to_difficulty(bits: u32) -> f64 {
 
 fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    // synchronous=OFF: no fsyncs. This is exported/re-computable data so crash-safety
-    // is not required. Eliminates the two fsyncs per commit cycle (WAL + main DB)
-    // that were causing 30+ second stalls on spinning disk.
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=17179869184;")?;
+    // synchronous=OFF: no fsyncs (re-computable data, crash-safety not required).
+    // wal_autocheckpoint=0: disable the default auto-checkpoint that fires inside
+    // every COMMIT call when WAL >= 1000 pages. Without this, our 300MB WAL was
+    // being flushed to disk inside COMMIT (5s stall), while our explicit
+    // wal_checkpoint(RESTART) found nothing left to do (0ms). With auto-checkpoint
+    // disabled, COMMIT is fast and our explicit RESTART checkpoint does the work
+    // as a simple memcpy into the mmap'd DB (~100ms with synchronous=OFF).
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=-524288; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=17179869184;")?;
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS block_idx (
             hash        TEXT NOT NULL PRIMARY KEY,
