@@ -1009,7 +1009,7 @@ fn main() -> Result<()> {
                     ins.execute(params![txid_bytes.as_slice(), *vout])?;
                 }
                 db.execute(
-                    "DELETE FROM utxo WHERE EXISTS (SELECT 1 FROM del_batch WHERE del_batch.txid=utxo.txid AND del_batch.vout=utxo.vout)",
+                    "DELETE FROM utxo WHERE (txid, vout) IN (SELECT txid, vout FROM del_batch)",
                     [],
                 )?;
                 db.execute("DELETE FROM del_batch", [])?;
