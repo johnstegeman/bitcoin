@@ -914,6 +914,10 @@ fn main() -> Result<()> {
         if height % COMMIT_EVERY == 0 || height == end {
             let t0 = Instant::now();
             db.execute("COMMIT", [])?;
+            // Reset WAL to zero after each commit so it never grows large.
+            // Without this the WAL accumulates across commits and checkpoint
+            // overhead compounds as the UTXO set grows.
+            db.execute_batch("PRAGMA wal_checkpoint(RESTART)")?;
             w.flush_all()?;
             timings.commit += t0.elapsed();
             if height < end {
