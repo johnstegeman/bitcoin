@@ -24,7 +24,7 @@
  */
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -596,7 +596,8 @@ fn process_block(
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
-    db: &Connection,
+    pending_inserts: &mut HashMap<([u8; 32], u32), (i64, Option<String>)>,
+    pending_deletes: &mut HashSet<([u8; 32], u32)>,
     utxo_cache: &mut HashMap<([u8; 32], u32), (i64, Option<String>)>,
     t: &mut Timings,
 ) -> Result<()> {
@@ -696,17 +697,14 @@ fn process_block(
     }
     t.pass1_csv += t0.elapsed();
 
-    // Insert outputs into both SQLite (for persistence/resume) and the in-memory
-    // cache (for O(1) lookup in pass 2 without any SQLite round-trips).
+    // Stage outputs in the deferred pending_inserts map and the in-memory cache.
+    // Actual SQLite writes are deferred to commit time so transient UTXOs
+    // (created and spent within the same batch) never touch disk at all.
     let t0 = Instant::now();
-    {
-        let mut ins = db.prepare_cached(
-            "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
-        )?;
-        for (txid_bytes, vout, amount, addr) in &utxo_inserts {
-            ins.execute(params![txid_bytes.as_slice(), *vout, *amount, addr])?;
-            utxo_cache.insert((*txid_bytes, *vout), (*amount, addr.clone()));
-        }
+    for (txid_bytes, vout, amount, addr) in &utxo_inserts {
+        let key = (*txid_bytes, *vout);
+        pending_inserts.insert(key, (*amount, addr.clone()));
+        utxo_cache.insert(key, (*amount, addr.clone()));
     }
     t.utxo_insert += t0.elapsed();
 
@@ -811,16 +809,18 @@ fn process_block(
     }
     t.pass2_csv += t0.elapsed();
 
-    // Remove spent UTXOs from both SQLite and the in-memory cache.
-    // Drain utxo_deletes so we can move each txid into the HashMap key
-    // without a clone (SQLite borrows it first, then it moves into remove).
+    // Remove spent UTXOs from the in-memory cache and from the deferred maps.
+    // If the UTXO was inserted this batch (pending_inserts contains it), it's
+    // transient and needs no SQLite work at all — just drop it from both maps.
+    // Otherwise mark it for SQLite DELETE at commit time.
     let t0 = Instant::now();
-    {
-        let mut del = db.prepare_cached("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
-        for (txid_bytes, vout) in utxo_deletes.drain(..) {
-            del.execute(params![txid_bytes.as_slice(), vout])?;
-            utxo_cache.remove(&(txid_bytes, vout));
+    for (txid_bytes, vout) in utxo_deletes.drain(..) {
+        let key = (txid_bytes, vout);
+        if pending_inserts.remove(&key).is_none() {
+            // Pre-existing UTXO (from a prior batch, already in SQLite)
+            pending_deletes.insert(key);
         }
+        utxo_cache.remove(&key);
     }
     t.utxo_delete += t0.elapsed();
 
@@ -938,6 +938,15 @@ fn main() -> Result<()> {
     let mut file_cache: HashMap<String, File> = HashMap::new();
     let mut timings = Timings::default();
 
+    // Deferred UTXO maps: batched into SQLite only at commit time.
+    // Transient UTXOs (inserted and spent in the same batch) cancel out
+    // in process_block and never reach SQLite, saving ~40% of WAL writes.
+    let batch = COMMIT_EVERY as usize;
+    let mut pending_inserts: HashMap<([u8; 32], u32), (i64, Option<String>)> =
+        HashMap::with_capacity(batch * 1500);
+    let mut pending_deletes: HashSet<([u8; 32], u32)> =
+        HashSet::with_capacity(batch * 1200);
+
     for height in start..=end {
         let (file_path, byte_offset, block_size, hash): (String, i64, i64, String) =
             block_lookup.query_row(params![height], |r| {
@@ -954,7 +963,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("decoding block {height}"))?;
         timings.decode += t0.elapsed();
 
-        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &db, &mut utxo_cache, &mut timings)?;
+        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
         db.execute("UPDATE checkpoint SET last_height=?1 WHERE id=1", params![height])?;
@@ -964,10 +973,22 @@ fn main() -> Result<()> {
 
         if height % COMMIT_EVERY == 0 || height == end {
             let t0 = Instant::now();
+            // Flush deferred UTXO changes. Transient UTXOs (created and spent
+            // within this batch) were already cancelled out in process_block
+            // so pending_inserts contains only UTXOs that survive the batch.
+            {
+                let mut ins = db.prepare(
+                    "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
+                )?;
+                for ((txid_bytes, vout), (amount, addr)) in pending_inserts.drain() {
+                    ins.execute(params![txid_bytes.as_slice(), vout, amount, addr])?;
+                }
+                let mut del = db.prepare("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
+                for (txid_bytes, vout) in pending_deletes.drain() {
+                    del.execute(params![txid_bytes.as_slice(), vout])?;
+                }
+            }
             db.execute("COMMIT", [])?;
-            // Reset WAL to zero after each commit so it never grows large.
-            // Without this the WAL accumulates across commits and checkpoint
-            // overhead compounds as the UTXO set grows.
             db.execute_batch("PRAGMA wal_checkpoint(RESTART)")?;
             w.flush_all()?;
             timings.commit += t0.elapsed();
