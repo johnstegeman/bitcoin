@@ -23,8 +23,8 @@
  *   cypher-shell < ../post_import.cypher
  */
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
-    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -579,7 +579,7 @@ fn read_raw_block(
     file_path: &str,
     byte_offset: i64,
     block_size: i64,
-    file_cache: &mut HashMap<String, File>,
+    file_cache: &mut FxHashMap<String, File>,
 ) -> Result<Vec<u8>> {
     let f = if let Some(f) = file_cache.get_mut(file_path) {
         f
@@ -603,9 +603,9 @@ fn process_block(
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
-    pending_inserts: &mut HashMap<([u8; 32], u32), (i64, Option<String>)>,
-    pending_deletes: &mut HashSet<([u8; 32], u32)>,
-    utxo_cache: &mut HashMap<([u8; 32], u32), (i64, Option<String>)>,
+    pending_inserts: &mut FxHashMap<([u8; 32], u32), (i64, Option<String>)>,
+    pending_deletes: &mut FxHashSet<([u8; 32], u32)>,
+    utxo_cache: &mut FxHashMap<([u8; 32], u32), (i64, Option<String>)>,
     t: &mut Timings,
 ) -> Result<()> {
     let block_hash = block.header.block_hash().to_string();
@@ -659,7 +659,7 @@ fn process_block(
         let mut total_output: i64 = 0;
 
         // address → (outputCount, amountReceived) for BENEFITS_TO
-        let mut benefits: HashMap<String, (i32, i64)> = HashMap::new();
+        let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
 
         for (n, txout) in tx.output.iter().enumerate() {
             let output_id   = format!("{}:{}", txid, n);
@@ -731,7 +731,7 @@ fn process_block(
         let mut total_input: i64 = 0;
 
         // address → (inputCount, amountSpent) for PERFORMS
-        let mut performs: HashMap<String, (i32, i64)> = HashMap::new();
+        let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
 
         for (idx, txin) in tx.input.iter().enumerate() {
             let input_id       = format!("{}:{}", txid, idx);
@@ -925,7 +925,7 @@ fn main() -> Result<()> {
     // without any SQLite round-trips. SQLite remains the source of truth for
     // persistence; the cache is just a mirror kept in sync during processing.
     print!("  Loading UTXO cache from SQLite... ");
-    let mut utxo_cache: HashMap<([u8; 32], u32), (i64, Option<String>)> = HashMap::new();
+    let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, Option<String>)> = FxHashMap::default();
     {
         let mut stmt = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
         let mut rows = stmt.query([])?;
@@ -942,17 +942,17 @@ fn main() -> Result<()> {
     println!("{} UTXOs loaded.", utxo_cache.len());
 
     let total = (end - start + 1).max(1);
-    let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut file_cache: FxHashMap<String, File> = FxHashMap::default();
     let mut timings = Timings::default();
 
     // Deferred UTXO maps: batched into SQLite only at commit time.
     // Transient UTXOs (inserted and spent in the same batch) cancel out
     // in process_block and never reach SQLite, saving ~40% of WAL writes.
     let batch = COMMIT_EVERY as usize;
-    let mut pending_inserts: HashMap<([u8; 32], u32), (i64, Option<String>)> =
-        HashMap::with_capacity(batch * 1500);
-    let mut pending_deletes: HashSet<([u8; 32], u32)> =
-        HashSet::with_capacity(batch * 1200);
+    let mut pending_inserts: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
+        FxHashMap::with_capacity_and_hasher(batch * 1500, Default::default());
+    let mut pending_deletes: FxHashSet<([u8; 32], u32)> =
+        FxHashSet::with_capacity_and_hasher(batch * 1200, Default::default());
 
     for height in start..=end {
         let (file_path, byte_offset, block_size, hash): (String, i64, i64, String) =
