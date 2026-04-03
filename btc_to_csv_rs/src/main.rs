@@ -534,6 +534,7 @@ fn process_block(
     prev_block_hash: Option<&str>,
     w: &mut Writers,
     db: &Connection,
+    utxo_cache: &mut HashMap<(String, u32), (i64, Option<String>)>,
     t: &mut Timings,
 ) -> Result<()> {
     let block_hash = block.header.block_hash().to_string();
@@ -630,8 +631,8 @@ fn process_block(
     }
     t.pass1_csv += t0.elapsed();
 
-    // Batch-insert all outputs from this block into the UTXO cache.
-    // Must complete before Pass 2 reads from it (same SQLite connection = visible).
+    // Insert outputs into both SQLite (for persistence/resume) and the in-memory
+    // cache (for O(1) lookup in pass 2 without any SQLite round-trips).
     let t0 = Instant::now();
     {
         let mut ins = db.prepare_cached(
@@ -639,52 +640,13 @@ fn process_block(
         )?;
         for (txid, vout, amount, addr) in &utxo_inserts {
             ins.execute(params![txid, *vout, *amount, addr])?;
+            utxo_cache.insert((txid.clone(), *vout), (*amount, addr.clone()));
         }
     }
     t.utxo_insert += t0.elapsed();
 
-    // ─────────────────────────────────────────────────────────────────────
-    // PRE-PASS: batch-fetch all UTXOs needed for pass 2 in one JOIN query.
-    // Eliminates N individual SQLite round-trips (one per non-coinbase input).
-    // ─────────────────────────────────────────────────────────────────────
-
-    let t0 = Instant::now();
-    db.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS _lookup \
-         (txid TEXT NOT NULL, vout INTEGER NOT NULL, \
-          PRIMARY KEY (txid, vout)) WITHOUT ROWID"
-    )?;
-    db.execute("DELETE FROM _lookup", [])?;
-    {
-        let mut ins = db.prepare_cached("INSERT OR IGNORE INTO _lookup VALUES (?1,?2)")?;
-        for tx in &block.txdata {
-            if !tx.is_coinbase() {
-                for txin in &tx.input {
-                    ins.execute(params![
-                        txin.previous_output.txid.to_string(),
-                        txin.previous_output.vout,
-                    ])?;
-                }
-            }
-        }
-    }
-    // Single query fetches every needed UTXO via PK join.
-    let mut utxo_cache: HashMap<(String, u32), (i64, Option<String>)> = HashMap::new();
-    {
-        let mut stmt = db.prepare_cached(
-            "SELECT l.txid, l.vout, u.amount, u.address \
-             FROM _lookup l \
-             LEFT JOIN utxo u ON u.txid=l.txid AND u.vout=l.vout"
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            utxo_cache.insert(
-                (row.get(0)?, row.get::<_, u32>(1)?),
-                (row.get(2)?, row.get(3)?),
-            );
-        }
-    }
-    t.utxo_lookup += t0.elapsed();
+    // PRE-PASS eliminated: UTXO lookups now served from the in-memory
+    // utxo_cache (loaded at startup and kept in sync), so utxo_look ≈ 0.
 
     // ─────────────────────────────────────────────────────────────────────
     // PASS 2: inputs — use in-memory cache, compute fees, write Transaction
@@ -783,13 +745,15 @@ fn process_block(
     }
     t.pass2_csv += t0.elapsed();
 
-    // Delete spent UTXOs. Individual PK deletes on WITHOUT ROWID table are
-    // faster than the temp-table batch approach (no per-block table overhead).
+    // Remove spent UTXOs from both SQLite and the in-memory cache.
+    // Drain utxo_deletes so we can move each txid into the HashMap key
+    // without a clone (SQLite borrows it first, then it moves into remove).
     let t0 = Instant::now();
     {
         let mut del = db.prepare_cached("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
-        for (txid, vout) in &utxo_deletes {
-            del.execute(params![txid, *vout])?;
+        for (txid, vout) in utxo_deletes.drain(..) {
+            del.execute(params![&txid, vout])?;
+            utxo_cache.remove(&(txid, vout));
         }
     }
     t.utxo_delete += t0.elapsed();
@@ -883,6 +847,23 @@ fn main() -> Result<()> {
         None
     };
 
+    // Load the entire UTXO set into memory so pass 2 can do O(1) lookups
+    // without any SQLite round-trips. SQLite remains the source of truth for
+    // persistence; the cache is just a mirror kept in sync during processing.
+    print!("  Loading UTXO cache from SQLite... ");
+    let mut utxo_cache: HashMap<(String, u32), (i64, Option<String>)> = HashMap::new();
+    {
+        let mut stmt = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            utxo_cache.insert(
+                (row.get(0)?, row.get::<_, u32>(1)?),
+                (row.get(2)?, row.get(3)?),
+            );
+        }
+    }
+    println!("{} UTXOs loaded.", utxo_cache.len());
+
     let total = (end - start + 1).max(1);
     let mut file_cache: HashMap<String, File> = HashMap::new();
     let mut timings = Timings::default();
@@ -903,7 +884,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("decoding block {height}"))?;
         timings.decode += t0.elapsed();
 
-        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &db, &mut timings)?;
+        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &db, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
         db.execute("UPDATE checkpoint SET last_height=?1 WHERE id=1", params![height])?;
