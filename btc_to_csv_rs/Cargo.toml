@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 bitcoin  = "0.32"
 rusqlite = { version = "0.31", features = ["bundled"] }   # bundled = no system SQLite needed
+rocksdb  = { version = "0.22", features = [] }            # UTXO KV store (LSM, fast batch writes)
 csv      = "1"
 clap     = { version = "4", features = ["derive"] }
 anyhow   = "1"

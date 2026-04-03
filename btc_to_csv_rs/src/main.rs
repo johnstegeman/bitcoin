@@ -24,11 +24,14 @@
  */
 
 use itoa::Buffer as ItoaBuf;
+use rocksdb::{Options as RocksOptions, WriteBatch, DB as RocksDB};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -194,14 +197,6 @@ fn open_db(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_block_idx_prev ON block_idx(prev_hash);
         CREATE INDEX IF NOT EXISTS idx_block_idx_height ON block_idx(height);
 
-        CREATE TABLE IF NOT EXISTS utxo (
-            txid    BLOB    NOT NULL,   -- 32 raw bytes (bitcoin::Txid::to_byte_array)
-            vout    INTEGER NOT NULL,
-            amount  INTEGER NOT NULL,
-            address TEXT,
-            PRIMARY KEY (txid, vout)
-        ) WITHOUT ROWID;
-
         CREATE TABLE IF NOT EXISTS checkpoint (
             id           INTEGER PRIMARY KEY CHECK (id = 1),
             phase        TEXT    NOT NULL DEFAULT 'index',
@@ -209,73 +204,54 @@ fn open_db(path: &Path) -> Result<Connection> {
         );
         INSERT OR IGNORE INTO checkpoint (id, phase, last_height) VALUES (1, 'index', -1);
     ")?;
-    // Temp table for batched UTXO deletes: populated at each commit, then joined
-    // against utxo in a single DELETE ... WHERE EXISTS query rather than N individual
-    // point-deletes. Lives in memory (PRAGMA temp_store=MEMORY).
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS del_batch (txid BLOB NOT NULL, vout INTEGER NOT NULL, PRIMARY KEY (txid, vout)) WITHOUT ROWID")?;
     Ok(conn)
 }
 
-/// One-time migration: if the utxo table still has TEXT txids (old schema),
-/// convert to 32-byte BLOB. BLOB keys are 2-3x faster for B-tree operations
-/// (shorter comparisons, higher fan-out, smaller pages, better cache usage).
-fn migrate_utxo_if_needed(db: &Connection) -> Result<()> {
-    let txid_type: String = db.query_row(
-        "SELECT type FROM pragma_table_info('utxo') WHERE name='txid'",
-        [], |r| r.get(0),
-    ).unwrap_or_default();
+// ─── RocksDB UTXO store ───────────────────────────────────────────────────────
 
-    if !txid_type.eq_ignore_ascii_case("text") {
-        return Ok(());
-    }
+/// 36-byte key: 32-byte txid || 4-byte vout (big-endian, preserves sort order).
+fn utxo_key(txid: &[u8; 32], vout: u32) -> [u8; 36] {
+    let mut k = [0u8; 36];
+    k[..32].copy_from_slice(txid);
+    k[32..].copy_from_slice(&vout.to_be_bytes());
+    k
+}
 
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM utxo", [], |r| r.get(0))?;
-    if count == 0 {
-        db.execute_batch("
-            DROP TABLE utxo;
-            CREATE TABLE utxo (
-                txid    BLOB    NOT NULL,
-                vout    INTEGER NOT NULL,
-                amount  INTEGER NOT NULL,
-                address TEXT,
-                PRIMARY KEY (txid, vout)
-            ) WITHOUT ROWID;
-        ")?;
-        return Ok(());
-    }
+/// Value: 8-byte little-endian i64 amount || UTF-8 address (absent = None).
+fn utxo_val_encode(amount: i64, addr: &Option<String>) -> Vec<u8> {
+    let mut v = amount.to_le_bytes().to_vec();
+    if let Some(a) = addr { v.extend_from_slice(a.as_bytes()); }
+    v
+}
 
-    println!("  Migrating {} UTXO rows from TEXT to BLOB txids (one-time)...", count);
-    db.execute_batch("
-        CREATE TABLE utxo_new (
-            txid    BLOB    NOT NULL,
-            vout    INTEGER NOT NULL,
-            amount  INTEGER NOT NULL,
-            address TEXT,
-            PRIMARY KEY (txid, vout)
-        ) WITHOUT ROWID;
-    ")?;
-    db.execute("BEGIN", [])?;
-    {
-        let mut sel = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
-        let mut ins = db.prepare("INSERT INTO utxo_new VALUES (?1,?2,?3,?4)")?;
-        let mut rows = sel.query([])?;
-        while let Some(row) = rows.next()? {
-            let txid_hex: String = row.get(0)?;
-            let txid: bitcoin::Txid = txid_hex.parse()
-                .with_context(|| format!("parse txid {txid_hex}"))?;
-            let txid_bytes = *txid.as_byte_array();
-            ins.execute(params![txid_bytes.as_slice(),
-                row.get::<_, u32>(1)?, row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?])?;
-        }
-    }
-    db.execute("COMMIT", [])?;
-    db.execute_batch("
-        DROP TABLE utxo;
-        ALTER TABLE utxo_new RENAME TO utxo;
-    ")?;
-    println!("  Migration complete.");
-    Ok(())
+fn utxo_val_decode(b: &[u8]) -> (i64, Option<String>) {
+    let amount = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let addr = if b.len() > 8 {
+        Some(String::from_utf8_lossy(&b[8..]).into_owned())
+    } else {
+        None
+    };
+    (amount, addr)
+}
+
+fn open_utxo_db(path: &Path) -> Result<RocksDB> {
+    let mut opts = RocksOptions::default();
+    opts.create_if_missing(true);
+    opts.set_write_buffer_size(256 * 1024 * 1024); // 256 MB memtable before L0 flush
+    opts.set_max_write_buffer_number(4);
+    opts.set_compression_type(rocksdb::DBCompressionType::None);
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    Ok(RocksDB::open(&opts, path)?)
+}
+
+// ─── Reader thread message ────────────────────────────────────────────────────
+
+struct BlockMsg {
+    height:    i64,
+    block:     Block,
+    hash:      String,
+    read_us:   u64,
+    decode_us: u64,
 }
 
 // ─── Header files ─────────────────────────────────────────────────────────────
@@ -397,14 +373,14 @@ impl Writers {
 
 #[derive(Default)]
 struct Timings {
-    read:         Duration, // read_raw_block (file I/O)
-    decode:       Duration, // consensus_decode
+    read:         Duration, // read_raw_block (file I/O, overlapped in reader thread)
+    decode:       Duration, // consensus_decode (overlapped in reader thread)
     pass1_csv:    Duration, // pass 1: output/address CSV writes
-    utxo_insert:  Duration, // batch UTXO inserts to SQLite
-    utxo_lookup:  Duration, // per-input UTXO SELECT in pass 2
+    utxo_insert:  Duration, // in-memory UTXO cache insert (process_block)
+    utxo_lookup:  Duration, // in-memory UTXO cache lookup (process_block pass 2)
     pass2_csv:    Duration, // pass 2: input/tx CSV writes (excl. lookup)
-    utxo_delete:  Duration, // batch UTXO deletes from SQLite
-    commit:       Duration, // SQLite COMMIT + CSV flush
+    utxo_delete:  Duration, // in-memory UTXO cache delete (process_block)
+    commit:       Duration, // RocksDB WriteBatch + SQLite COMMIT + CSV flush
     checkpoint:   Duration, // UPDATE checkpoint row
     n_blocks:     u64,
     n_inputs:     u64,
@@ -843,9 +819,10 @@ fn main() -> Result<()> {
     let output_dir = expand_path(&args.output_dir);
     fs::create_dir_all(&output_dir)?;
 
-    let db_path = output_dir.join("utxo_cache.db");
-    let db = open_db(&db_path)?;
-    migrate_utxo_if_needed(&db)?;
+    let db_path      = output_dir.join("utxo_cache.db");
+    let utxo_db_path = output_dir.join("utxo_cache.rocksdb");
+    let db      = open_db(&db_path)?;
+    let utxo_db = open_utxo_db(&utxo_db_path)?;
 
     // ── Phase 1: build block index ────────────────────────────────────────
     let phase: String = db.query_row(
@@ -900,16 +877,9 @@ fn main() -> Result<()> {
     let appending = last_height >= 0 && args.start.is_none();
     let mut w = Writers::open(&output_dir, appending)?;
 
-    // Prepared statement for block lookup
-    let mut block_lookup = db.prepare(
-        "SELECT file_path, byte_offset, block_size, hash
-         FROM block_idx WHERE height = ?1"
-    )?;
-
-    const COMMIT_EVERY: i64 = 2000; // SQLite commit + CSV flush interval (blocks)
+    const COMMIT_EVERY: i64 = 2000;
     const LOG_EVERY: i64    = 1000;
 
-    db.execute("BEGIN", [])?;
     let mut prev_block_hash: Option<String> = if start > 0 {
         db.query_row(
             "SELECT hash FROM block_idx WHERE height = ?1",
@@ -920,56 +890,79 @@ fn main() -> Result<()> {
         None
     };
 
-    // Load the entire UTXO set into memory so pass 2 can do O(1) lookups
-    // without any SQLite round-trips. SQLite remains the source of truth for
-    // persistence; the cache is just a mirror kept in sync during processing.
-    print!("  Loading UTXO cache from SQLite... ");
+    // Load the entire UTXO set from RocksDB into memory.
+    // RocksDB is persistence-only; the in-memory FxHashMap is the live UTXO set.
+    print!("  Loading UTXO cache from RocksDB... ");
+    io::stdout().flush().ok();
     let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, Option<String>)> = FxHashMap::default();
-    {
-        let mut stmt = db.prepare("SELECT txid, vout, amount, address FROM utxo")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(0)?;
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&blob);
-            utxo_cache.insert(
-                (key, row.get::<_, u32>(1)?),
-                (row.get(2)?, row.get(3)?),
-            );
-        }
+    for item in utxo_db.iterator(rocksdb::IteratorMode::Start) {
+        let (k, v) = item?;
+        let txid: [u8; 32] = k[..32].try_into().unwrap();
+        let vout = u32::from_be_bytes(k[32..36].try_into().unwrap());
+        let (amount, addr) = utxo_val_decode(&v);
+        utxo_cache.insert((txid, vout), (amount, addr));
     }
     println!("{} UTXOs loaded.", utxo_cache.len());
 
     let total = (end - start + 1).max(1);
-    let mut file_cache: FxHashMap<String, File> = FxHashMap::default();
     let mut timings = Timings::default();
 
-    // Deferred UTXO maps: batched into SQLite only at commit time.
-    // Transient UTXOs (inserted and spent in the same batch) cancel out
-    // in process_block and never reach SQLite, saving ~40% of WAL writes.
-    let batch = COMMIT_EVERY as usize;
+    // Deferred UTXO maps: flushed to RocksDB via WriteBatch at commit time.
+    // Transient UTXOs (inserted and spent within the same batch) cancel out
+    // in process_block and never reach RocksDB, saving ~40% of write traffic.
+    let batch_cap = COMMIT_EVERY as usize;
     let mut pending_inserts: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
-        FxHashMap::with_capacity_and_hasher(batch * 1500, Default::default());
+        FxHashMap::with_capacity_and_hasher(batch_cap * 1500, Default::default());
     let mut pending_deletes: FxHashSet<([u8; 32], u32)> =
-        FxHashSet::with_capacity_and_hasher(batch * 1200, Default::default());
+        FxHashSet::with_capacity_and_hasher(batch_cap * 1200, Default::default());
 
-    for height in start..=end {
-        let (file_path, byte_offset, block_size, hash): (String, i64, i64, String) =
-            block_lookup.query_row(params![height], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            }).with_context(|| format!("block at height {height} not found in index"))?;
+    // ── Reader thread: pre-fetch + decode blocks, overlapping disk I/O with
+    //    the main thread's UTXO/CSV/RocksDB work. ─────────────────────────────
+    //
+    // Collect all block metadata upfront so the reader thread owns its data
+    // without holding a SQLite statement open across the channel lifetime.
+    let mut block_metas: Vec<(i64, String, i64, i64, String)> =
+        Vec::with_capacity(total as usize);
+    {
+        let mut stmt = db.prepare(
+            "SELECT height, file_path, byte_offset, block_size, hash
+             FROM block_idx WHERE height >= ?1 AND height <= ?2 ORDER BY height"
+        )?;
+        let mut rows = stmt.query(params![start, end])?;
+        while let Some(row) = rows.next()? {
+            block_metas.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?));
+        }
+    }
 
-        let t0 = Instant::now();
-        let raw = read_raw_block(&file_path, byte_offset, block_size, &mut file_cache)
-            .with_context(|| format!("reading block {height} from {file_path}"))?;
-        timings.read += t0.elapsed();
+    // Bound = 8 blocks: enough pipeline depth without unbounded memory growth
+    // (post-2016 blocks can be ~1 MB each → ≤8 MB buffered).
+    let (tx, rx) = mpsc::sync_channel::<anyhow::Result<BlockMsg>>(8);
+    thread::spawn(move || {
+        let mut file_cache: FxHashMap<String, File> = FxHashMap::default();
+        for (height, file_path, byte_offset, block_size, hash) in block_metas {
+            let t_read = Instant::now();
+            let result = read_raw_block(&file_path, byte_offset, block_size, &mut file_cache)
+                .with_context(|| format!("reading block {height}"));
+            let read_us = t_read.elapsed().as_micros() as u64;
+            let msg = result.and_then(|raw| {
+                let t_dec = Instant::now();
+                let block = Block::consensus_decode(&mut std::io::Cursor::new(&raw))
+                    .with_context(|| format!("decoding block {height}"))?;
+                Ok(BlockMsg { height, block, hash, read_us, decode_us: t_dec.elapsed().as_micros() as u64 })
+            });
+            if tx.send(msg).is_err() { break; }
+        }
+    });
 
-        let t0 = Instant::now();
-        let block = Block::consensus_decode(&mut std::io::Cursor::new(&raw))
-            .with_context(|| format!("decoding block {height}"))?;
-        timings.decode += t0.elapsed();
+    db.execute("BEGIN", [])?;
 
-        process_block(&block, height, prev_block_hash.as_deref(), &mut w, &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
+    for msg in rx {
+        let BlockMsg { height, block, hash, read_us, decode_us } = msg?;
+        timings.read   += Duration::from_micros(read_us);
+        timings.decode += Duration::from_micros(decode_us);
+
+        process_block(&block, height, prev_block_hash.as_deref(), &mut w,
+                      &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
         db.execute("UPDATE checkpoint SET last_height=?1 WHERE id=1", params![height])?;
@@ -979,42 +972,24 @@ fn main() -> Result<()> {
 
         if height % COMMIT_EVERY == 0 || height == end {
             let t0 = Instant::now();
-            // Flush deferred UTXO changes. Transient UTXOs (created and spent
-            // within this batch) were already cancelled out in process_block
-            // so pending_inserts contains only UTXOs that survive the batch.
-            //
-            // Sort by key before flushing: SQLite's B-tree is ordered by (txid, vout).
-            // Inserting/deleting in key order means consecutive operations hit the same
-            // or adjacent leaf pages → dramatically better page-cache hit rate and
-            // fewer random I/Os vs the random order from HashMap drain().
+
+            // Build RocksDB WriteBatch: puts for new UTXOs, deletes (LSM
+            // tombstones) for spent ones. Sort by key for better compaction locality.
             let mut inserts: Vec<_> = pending_inserts.drain().collect();
             inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            let t_ins0 = Instant::now();
-            {
-                let mut ins = db.prepare(
-                    "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
-                )?;
-                for ((txid_bytes, vout), (amount, addr)) in inserts {
-                    ins.execute(params![txid_bytes.as_slice(), vout, amount, addr])?;
-                }
-            }
-            let t_ins_ms = t_ins0.elapsed().as_secs_f64() * 1000.0;
-
             let mut deletes: Vec<_> = pending_deletes.drain().collect();
             deletes.sort_unstable();
-            let t_del0 = Instant::now();
-            {
-                let mut ins = db.prepare("INSERT INTO del_batch VALUES (?1,?2)")?;
-                for (txid_bytes, vout) in &deletes {
-                    ins.execute(params![txid_bytes.as_slice(), *vout])?;
-                }
-                db.execute(
-                    "DELETE FROM utxo WHERE (txid, vout) IN (SELECT txid, vout FROM del_batch)",
-                    [],
-                )?;
-                db.execute("DELETE FROM del_batch", [])?;
+
+            let t_rdb0 = Instant::now();
+            let mut batch = WriteBatch::default();
+            for ((txid, vout), (amount, addr)) in &inserts {
+                batch.put(utxo_key(txid, *vout), utxo_val_encode(*amount, addr));
             }
-            let t_del_ms = t_del0.elapsed().as_secs_f64() * 1000.0;
+            for (txid, vout) in &deletes {
+                batch.delete(utxo_key(txid, *vout));
+            }
+            utxo_db.write(batch)?;
+            let t_rdb_ms = t_rdb0.elapsed().as_secs_f64() * 1000.0;
 
             let t_commit0 = Instant::now();
             db.execute("COMMIT", [])?;
@@ -1026,7 +1001,7 @@ fn main() -> Result<()> {
 
             w.flush_all()?;
             timings.commit += t0.elapsed();
-            println!("    [commit @{height}] ins={t_ins_ms:.0}ms del={t_del_ms:.0}ms commit={t_commit_ms:.0}ms ckpt={t_ckpt_ms:.0}ms");
+            println!("    [commit @{height}] rdb={t_rdb_ms:.0}ms commit={t_commit_ms:.0}ms ckpt={t_ckpt_ms:.0}ms");
             if height < end {
                 db.execute("BEGIN", [])?;
             }
