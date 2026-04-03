@@ -672,9 +672,9 @@ fn process_block(
     let mut utxo_cache: HashMap<(String, u32), (i64, Option<String>)> = HashMap::new();
     {
         let mut stmt = db.prepare_cached(
-            "SELECT u.txid, u.vout, u.amount, u.address \
-             FROM utxo u \
-             WHERE EXISTS (SELECT 1 FROM _lookup l WHERE l.txid=u.txid AND l.vout=u.vout)"
+            "SELECT l.txid, l.vout, u.amount, u.address \
+             FROM _lookup l \
+             LEFT JOIN utxo u ON u.txid=l.txid AND u.vout=l.vout"
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
