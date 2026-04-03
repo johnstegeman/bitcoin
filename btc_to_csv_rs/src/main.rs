@@ -644,18 +644,56 @@ fn process_block(
     t.utxo_insert += t0.elapsed();
 
     // ─────────────────────────────────────────────────────────────────────
-    // PASS 2: inputs — look up spent UTXOs, compute fees, write Transaction
+    // PRE-PASS: batch-fetch all UTXOs needed for pass 2 in one JOIN query.
+    // Eliminates N individual SQLite round-trips (one per non-coinbase input).
+    // ─────────────────────────────────────────────────────────────────────
+
+    let t0 = Instant::now();
+    db.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS _lookup \
+         (txid TEXT NOT NULL, vout INTEGER NOT NULL, \
+          PRIMARY KEY (txid, vout)) WITHOUT ROWID"
+    )?;
+    db.execute("DELETE FROM _lookup", [])?;
+    {
+        let mut ins = db.prepare_cached("INSERT OR IGNORE INTO _lookup VALUES (?1,?2)")?;
+        for tx in &block.txdata {
+            if !tx.is_coinbase() {
+                for txin in &tx.input {
+                    ins.execute(params![
+                        txin.previous_output.txid.to_string(),
+                        txin.previous_output.vout,
+                    ])?;
+                }
+            }
+        }
+    }
+    // Single query fetches every needed UTXO via PK join.
+    let mut utxo_cache: HashMap<(String, u32), (i64, Option<String>)> = HashMap::new();
+    {
+        let mut stmt = db.prepare_cached(
+            "SELECT u.txid, u.vout, u.amount, u.address \
+             FROM utxo u \
+             WHERE EXISTS (SELECT 1 FROM _lookup l WHERE l.txid=u.txid AND l.vout=u.vout)"
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            utxo_cache.insert(
+                (row.get(0)?, row.get::<_, u32>(1)?),
+                (row.get(2)?, row.get(3)?),
+            );
+        }
+    }
+    t.utxo_lookup += t0.elapsed();
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PASS 2: inputs — use in-memory cache, compute fees, write Transaction
     //         nodes, Input nodes, and PERFORMS/SPENDS relationships.
     // ─────────────────────────────────────────────────────────────────────
 
     let mut utxo_deletes: Vec<(String, u32)> = Vec::new();
 
-    let mut lookup = db.prepare_cached(
-        "SELECT amount, address FROM utxo WHERE txid=?1 AND vout=?2"
-    )?;
-
     let t0 = Instant::now();
-    let mut lookup_in_block = Duration::ZERO;
     for (tx, (txid, total_output)) in block.txdata.iter().zip(tx_totals.iter()) {
         let is_coinbase = tx.is_coinbase();
         let mut total_input: i64 = 0;
@@ -686,20 +724,11 @@ fn process_block(
 
                 w.rels_spends.write_record(vec![input_id, prev_out_id])?;
 
-                // Look up spent UTXO for amount and sender address
-                let tl = Instant::now();
-                let result = lookup.query_row(params![&prev_txid, prev_vout], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-                }).optional()?;
-                let elapsed = tl.elapsed();
-                t.utxo_lookup += elapsed;
-                lookup_in_block += elapsed;
-
-                match result {
+                match utxo_cache.get(&(prev_txid.clone(), prev_vout)) {
                     Some((amt, addr)) => {
                         total_input += amt;
                         if let Some(a) = addr {
-                            let e = performs.entry(a).or_insert((0, 0));
+                            let e = performs.entry(a.clone()).or_insert((0, 0));
                             e.0 += 1;
                             e.1 += amt;
                         }
@@ -752,21 +781,16 @@ fn process_block(
             ])?;
         }
     }
-    t.pass2_csv += t0.elapsed() - lookup_in_block;
+    t.pass2_csv += t0.elapsed();
 
-    // Delete spent UTXOs from cache via a temp table batch delete.
-    // One DELETE JOIN is far faster than N individual DELETEs at scale.
+    // Delete spent UTXOs. Individual PK deletes on WITHOUT ROWID table are
+    // faster than the temp-table batch approach (no per-block table overhead).
     let t0 = Instant::now();
-    if !utxo_deletes.is_empty() {
-        db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS _del (txid TEXT, vout INTEGER)")?;
-        db.execute("DELETE FROM _del", [])?;
-        {
-            let mut ins = db.prepare_cached("INSERT INTO _del VALUES (?1,?2)")?;
-            for (txid, vout) in &utxo_deletes {
-                ins.execute(params![txid, *vout])?;
-            }
+    {
+        let mut del = db.prepare_cached("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
+        for (txid, vout) in &utxo_deletes {
+            del.execute(params![txid, *vout])?;
         }
-        db.execute_batch("DELETE FROM utxo WHERE (txid,vout) IN (SELECT txid,vout FROM _del)")?;
     }
     t.utxo_delete += t0.elapsed();
 
