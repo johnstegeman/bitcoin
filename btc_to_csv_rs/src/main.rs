@@ -28,7 +28,7 @@ use rocksdb::{Options as RocksOptions, WriteBatch, DB as RocksDB};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -554,27 +554,6 @@ fn assign_heights(db: &Connection) -> Result<()> {
 
 // ─── Phase 2: Block processing ────────────────────────────────────────────────
 
-/// Read raw block bytes from a .blk file at the stored offset.
-/// Takes a cache of open file handles to avoid reopening on every call.
-fn read_raw_block(
-    file_path: &str,
-    byte_offset: i64,
-    block_size: i64,
-    file_cache: &mut FxHashMap<String, File>,
-) -> Result<Vec<u8>> {
-    let f = if let Some(f) = file_cache.get_mut(file_path) {
-        f
-    } else {
-        let f = File::open(file_path)
-            .with_context(|| format!("open {file_path}"))?;
-        file_cache.insert(file_path.to_string(), f);
-        file_cache.get_mut(file_path).unwrap()
-    };
-    f.seek(SeekFrom::Start(byte_offset as u64))?;
-    let mut buf = vec![0u8; block_size as usize];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
 
 /// Process one block: write all CSV rows and update the UTXO cache.
 /// Both passes are wrapped in a single SQLite transaction (BEGIN/COMMIT
@@ -968,22 +947,49 @@ fn main() -> Result<()> {
         }
     }
 
-    // Bound = 8 blocks: enough pipeline depth without unbounded memory growth
-    // (post-2016 blocks can be ~1 MB each → ≤8 MB buffered).
+    // Reader thread: load entire blk files into memory sequentially, eliminating
+    // per-block seeks on spinning disk. With 64 GB RAM and 128 MB blk files,
+    // peak memory usage is ~128 MB (one file) + channel buffer.
+    // read_us for the first block in each file includes the full file read;
+    // subsequent blocks from the same file report near-zero read time.
     let (tx, rx) = mpsc::sync_channel::<anyhow::Result<BlockMsg>>(8);
     thread::spawn(move || {
-        let mut file_cache: FxHashMap<String, File> = FxHashMap::default();
+        // (file_path, file_contents) — holds one blk file at a time
+        let mut cached: Option<(String, Vec<u8>)> = None;
+
         for (height, file_path, byte_offset, block_size, hash) in block_metas {
+            // Load the blk file into memory when the path changes
             let t_read = Instant::now();
-            let result = read_raw_block(&file_path, byte_offset, block_size, &mut file_cache)
-                .with_context(|| format!("reading block {height}"));
+            let need_load = cached.as_ref().map(|(p, _)| p != &file_path).unwrap_or(true);
+            if need_load {
+                let mut f = match File::open(&file_path)
+                    .with_context(|| format!("open {file_path}"))
+                {
+                    Ok(f) => f,
+                    Err(e) => { let _ = tx.send(Err(e)); break; }
+                };
+                let mut contents = Vec::new();
+                if let Err(e) = f.read_to_end(&mut contents)
+                    .with_context(|| format!("read {file_path}"))
+                {
+                    let _ = tx.send(Err(e)); break;
+                }
+                cached = Some((file_path, contents));
+            }
             let read_us = t_read.elapsed().as_micros() as u64;
-            let msg = result.and_then(|raw| {
-                let t_dec = Instant::now();
-                let block = Block::consensus_decode(&mut std::io::Cursor::new(&raw))
-                    .with_context(|| format!("decoding block {height}"))?;
-                Ok(BlockMsg { height, block, hash, read_us, decode_us: t_dec.elapsed().as_micros() as u64 })
-            });
+
+            let contents = &cached.as_ref().unwrap().1;
+            let start = byte_offset as usize;
+            let end   = start + block_size as usize;
+
+            let t_dec = Instant::now();
+            let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
+                .with_context(|| format!("decoding block {height}"))
+                .map(|block| BlockMsg {
+                    height, block, hash, read_us,
+                    decode_us: t_dec.elapsed().as_micros() as u64,
+                });
+
             if tx.send(msg).is_err() { break; }
         }
     });
