@@ -976,15 +976,25 @@ fn main() -> Result<()> {
             // Flush deferred UTXO changes. Transient UTXOs (created and spent
             // within this batch) were already cancelled out in process_block
             // so pending_inserts contains only UTXOs that survive the batch.
+            //
+            // Sort by key before flushing: SQLite's B-tree is ordered by (txid, vout).
+            // Inserting/deleting in key order means consecutive operations hit the same
+            // or adjacent leaf pages → dramatically better page-cache hit rate and
+            // fewer random I/Os vs the random order from HashMap drain().
             {
+                let mut inserts: Vec<_> = pending_inserts.drain().collect();
+                inserts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 let mut ins = db.prepare(
                     "INSERT OR REPLACE INTO utxo (txid, vout, amount, address) VALUES (?1,?2,?3,?4)"
                 )?;
-                for ((txid_bytes, vout), (amount, addr)) in pending_inserts.drain() {
+                for ((txid_bytes, vout), (amount, addr)) in inserts {
                     ins.execute(params![txid_bytes.as_slice(), vout, amount, addr])?;
                 }
+
+                let mut deletes: Vec<_> = pending_deletes.drain().collect();
+                deletes.sort_unstable();
                 let mut del = db.prepare("DELETE FROM utxo WHERE txid=?1 AND vout=?2")?;
-                for (txid_bytes, vout) in pending_deletes.drain() {
+                for (txid_bytes, vout) in deletes {
                     del.execute(params![txid_bytes.as_slice(), vout])?;
                 }
             }
