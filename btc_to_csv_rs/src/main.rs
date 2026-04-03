@@ -717,37 +717,63 @@ fn process_block(
 
     let mut utxo_deletes: Vec<([u8; 32], u32)> = Vec::new();
 
+    // Reusable per-block buffers for pass 2 — same pattern as pass 1.
+    let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
+    let mut input_id      = String::with_capacity(80);
+    let mut prev_out_id   = String::with_capacity(80);
+    let mut script_sig_buf: Vec<u8> = Vec::with_capacity(202);
+    let mut ibuf_idx   = ItoaBuf::new();
+    let mut ibuf_seq   = ItoaBuf::new();
+    let mut ibuf_pvout = ItoaBuf::new();
+    let mut tb1 = ItoaBuf::new(); let mut tb2 = ItoaBuf::new();
+    let mut tb3 = ItoaBuf::new(); let mut tb4 = ItoaBuf::new();
+    let mut tb5 = ItoaBuf::new(); let mut tb6 = ItoaBuf::new();
+    let mut tb7 = ItoaBuf::new(); let mut tb8 = ItoaBuf::new();
+    let mut tb9 = ItoaBuf::new();
+    let mut ibuf_cnt = ItoaBuf::new();
+    let mut ibuf_spt = ItoaBuf::new();
+
     let t0 = Instant::now();
     for (tx, (txid, total_output)) in block.txdata.iter().zip(tx_totals.iter()) {
         let is_coinbase = tx.is_coinbase();
         let mut total_input: i64 = 0;
 
-        // address → (inputCount, amountSpent) for PERFORMS
-        let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
+        performs.clear();
 
-        let mut ibuf_idx = ItoaBuf::new();
-        let mut ibuf_seq = ItoaBuf::new();
-        let mut ibuf_pvout = ItoaBuf::new();
         for (idx, txin) in tx.input.iter().enumerate() {
-            let input_id       = format!("{}:{}", txid, idx);
-            let sequence       = txin.sequence.0 as i64;
-            let witness        = encode_witness(&txin.witness);
-            let script_sig_hex = hex::encode(txin.script_sig.as_bytes());
+            let sequence = txin.sequence.0 as i64;
+            let witness  = encode_witness(&txin.witness);
+
+            // input_id: txid + ':' + idx
+            input_id.clear();
+            input_id.push_str(txid);
+            input_id.push(':');
+            input_id.push_str(ibuf_idx.format(idx));
+
+            // script_sig hex into reusable buffer
+            let sig_bytes = txin.script_sig.as_bytes();
+            script_sig_buf.resize(sig_bytes.len() * 2, 0);
+            hex::encode_to_slice(sig_bytes, &mut script_sig_buf).unwrap();
 
             w.nodes_input.write_record(&[
-                &input_id, ibuf_idx.format(idx), &script_sig_hex,
-                ibuf_seq.format(sequence), &witness,
+                input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
+                &script_sig_buf, ibuf_seq.format(sequence).as_bytes(),
+                witness.as_bytes(),
             ])?;
-            w.rels_has_input.write_record(&[&txid, &input_id])?;
+            w.rels_has_input.write_record(&[txid.as_bytes(), input_id.as_bytes()])?;
             t.n_inputs += 1;
 
             if !is_coinbase {
-                let prev_txid   = &txin.previous_output.txid; // &bitcoin::Txid
-                let prev_vout   = txin.previous_output.vout;
-                let prev_out_id = format!("{}:{}", prev_txid, ibuf_pvout.format(prev_vout));
-                let prev_bytes  = *prev_txid.as_byte_array(); // [u8; 32], no alloc
+                let prev_txid = &txin.previous_output.txid;
+                let prev_vout = txin.previous_output.vout;
+                let prev_bytes = *prev_txid.as_byte_array();
 
-                w.rels_spends.write_record(&[&input_id, &prev_out_id])?;
+                // prev_out_id: prev_txid display + ':' + prev_vout
+                prev_out_id.clear();
+                use std::fmt::Write as FmtWrite;
+                write!(prev_out_id, "{}:{}", prev_txid, ibuf_pvout.format(prev_vout)).unwrap();
+
+                w.rels_spends.write_record(&[input_id.as_bytes(), prev_out_id.as_bytes()])?;
 
                 match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
@@ -759,7 +785,6 @@ fn process_block(
                         }
                     }
                     None => {
-                        // Expected only when --start > 0 (missing genesis UTXO history)
                         eprintln!("  WARN block {height}: UTXO not found {}:{}", prev_txid, prev_vout);
                     }
                 }
@@ -768,39 +793,33 @@ fn process_block(
             }
         }
 
-        // Coinbase: totalInput = 0, fee = 0
         let (total_input, fee) = if is_coinbase {
             (0i64, 0i64)
         } else {
             (total_input, total_input - total_output)
         };
 
-        // Transaction total size = serialized byte length (includes witness data).
-        // vsize and weight are cheaper to compute from the parsed struct.
         let tx_size   = tx.total_size() as i64;
         let tx_vsize  = tx.vsize() as i64;
         let tx_weight = tx.weight().to_wu() as i64;
+        let coinbase_str = if is_coinbase { b"true" as &[u8] } else { b"false" };
 
-        // Transaction node
-        let (mut tb1, mut tb2, mut tb3, mut tb4, mut tb5, mut tb6, mut tb7, mut tb8, mut tb9) =
-            (ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(),
-             ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new());
-        let coinbase_str = if is_coinbase { "true" } else { "false" };
         w.nodes_transaction.write_record(&[
-            txid.as_str(), tb1.format(height), block_hash.as_str(), time_str.as_str(),
-            tb2.format(total_input), tb3.format(*total_output), tb4.format(fee),
-            tb5.format(tx_size), tb6.format(tx_vsize), tb7.format(tx_weight),
-            tb8.format(tx.version.0), tb9.format(tx.lock_time.to_consensus_u32()),
+            txid.as_bytes(), tb1.format(height).as_bytes(),
+            block_hash.as_bytes(), time_str.as_bytes(),
+            tb2.format(total_input).as_bytes(), tb3.format(*total_output).as_bytes(),
+            tb4.format(fee).as_bytes(), tb5.format(tx_size).as_bytes(),
+            tb6.format(tx_vsize).as_bytes(), tb7.format(tx_weight).as_bytes(),
+            tb8.format(tx.version.0).as_bytes(),
+            tb9.format(tx.lock_time.to_consensus_u32()).as_bytes(),
             coinbase_str,
         ])?;
-        w.rels_included_in.write_record(&[&txid, &block_hash])?;
+        w.rels_included_in.write_record(&[txid.as_bytes(), block_hash.as_bytes()])?;
 
-        // PERFORMS – one relationship per unique sender address per tx
-        let mut ibuf_cnt = ItoaBuf::new();
-        let mut ibuf_spt = ItoaBuf::new();
         for (addr, (cnt, spent)) in &performs {
             w.rels_performs.write_record(&[
-                addr.as_str(), &txid, ibuf_cnt.format(*cnt), ibuf_spt.format(*spent),
+                addr.as_bytes(), txid.as_bytes(),
+                ibuf_cnt.format(*cnt).as_bytes(), ibuf_spt.format(*spent).as_bytes(),
             ])?;
         }
     }
