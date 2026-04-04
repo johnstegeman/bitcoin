@@ -246,13 +246,19 @@ fn open_utxo_db(path: &Path) -> Result<RocksDB> {
 
 // ─── Reader thread message ────────────────────────────────────────────────────
 
+struct OutputMeta {
+    stype:   &'static str,
+    address: Option<String>,
+}
+
 struct BlockMsg {
-    height:    i64,
-    block:     Block,
-    hash:      String,
-    read_us:   u64,
-    decode_us: u64,
-    txids:     Vec<bitcoin::Txid>,
+    height:       i64,
+    block:        Block,
+    hash:         String,
+    read_us:      u64,
+    decode_us:    u64,
+    txids:        Vec<bitcoin::Txid>,
+    output_metas: Vec<Vec<OutputMeta>>, // [tx_idx][output_idx]
 }
 
 // ─── Header files ─────────────────────────────────────────────────────────────
@@ -578,6 +584,7 @@ fn assign_heights(db: &Connection) -> Result<()> {
 fn process_block(
     block: &Block,
     txids: &[bitcoin::Txid],
+    output_metas: Vec<Vec<OutputMeta>>,
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
@@ -635,7 +642,7 @@ fn process_block(
     let mut ibuf_rcv = ItoaBuf::new();
 
     let t0 = Instant::now();
-    for (tx, txid_obj) in block.txdata.iter().zip(txids.iter()) {
+    for ((tx, txid_obj), tx_metas) in block.txdata.iter().zip(txids.iter()).zip(output_metas.into_iter()) {
         let t_txid = Instant::now();
         let txid       = txid_obj.to_string();      // hex string – for CSV
         let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for cache
@@ -645,14 +652,11 @@ fn process_block(
 
         benefits.clear();
 
-        for (n, txout) in tx.output.iter().enumerate() {
-            let amount = txout.value.to_sat() as i64;
-            let spk    = &txout.script_pubkey;
-
-            let t_script = Instant::now();
-            let stype  = script_type(spk);
-            let address = script_address(spk);
-            t.p1_script += t_script.elapsed();
+        for ((n, txout), meta) in tx.output.iter().enumerate().zip(tx_metas.into_iter()) {
+            let amount  = txout.value.to_sat() as i64;
+            let spk     = &txout.script_pubkey;
+            let stype   = meta.stype;
+            let address = meta.address;
 
             total_output += amount;
 
@@ -1017,10 +1021,16 @@ fn main() -> Result<()> {
                 .with_context(|| format!("decoding block {height}"))
                 .map(|block| {
                     let txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                    let output_metas: Vec<Vec<OutputMeta>> = block.txdata.iter().map(|tx| {
+                        tx.output.iter().map(|txout| {
+                            let spk = &txout.script_pubkey;
+                            OutputMeta { stype: script_type(spk), address: script_address(spk) }
+                        }).collect()
+                    }).collect();
                     BlockMsg {
                         height, block, hash, read_us,
                         decode_us: t_dec.elapsed().as_micros() as u64,
-                        txids,
+                        txids, output_metas,
                     }
                 });
 
@@ -1031,11 +1041,11 @@ fn main() -> Result<()> {
     db.execute("BEGIN", [])?;
 
     for msg in rx {
-        let BlockMsg { height, block, hash, read_us, decode_us, txids } = msg?;
+        let BlockMsg { height, block, hash, read_us, decode_us, txids, output_metas } = msg?;
         timings.read   += Duration::from_micros(read_us);
         timings.decode += Duration::from_micros(decode_us);
 
-        process_block(&block, &txids, height, prev_block_hash.as_deref(), &mut w,
+        process_block(&block, &txids, output_metas, height, prev_block_hash.as_deref(), &mut w,
                       &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
