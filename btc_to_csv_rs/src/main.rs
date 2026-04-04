@@ -376,6 +376,10 @@ struct Timings {
     read:         Duration, // read_raw_block (file I/O, overlapped in reader thread)
     decode:       Duration, // consensus_decode (overlapped in reader thread)
     pass1_csv:    Duration, // pass 1: output/address CSV writes
+    p1_txid:      Duration, //   └─ compute_txid + to_string
+    p1_script:    Duration, //   └─ script_type + script_address
+    p1_hex:       Duration, //   └─ hex::encode_to_slice (scriptPubKey)
+    p1_csv_write: Duration, //   └─ write_record calls
     utxo_insert:  Duration, // in-memory UTXO cache insert (process_block)
     utxo_lookup:  Duration, // in-memory UTXO cache lookup (process_block pass 2)
     pass2_csv:    Duration, // pass 2: input/tx CSV writes (excl. lookup)
@@ -408,6 +412,10 @@ impl Timings {
             "    pass1_csv  {:>8.1}ms {:>5.1}%   utxo_ins   {:>8.1}ms {:>5.1}%",
             ms(self.pass1_csv),   pct(self.pass1_csv),
             ms(self.utxo_insert), pct(self.utxo_insert),
+        );
+        println!(
+            "      p1_txid  {:>8.1}ms   p1_script {:>8.1}ms   p1_hex   {:>8.1}ms   p1_csv_wr {:>8.1}ms",
+            ms(self.p1_txid), ms(self.p1_script), ms(self.p1_hex), ms(self.p1_csv_write),
         );
         println!(
             "    utxo_look  {:>8.1}ms {:>5.1}%   pass2_csv  {:>8.1}ms {:>5.1}%",
@@ -618,9 +626,12 @@ fn process_block(
 
     let t0 = Instant::now();
     for tx in &block.txdata {
+        let t_txid = Instant::now();
         let txid_obj   = tx.compute_txid();
         let txid       = txid_obj.to_string();      // hex string – for CSV
         let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for cache
+        t.p1_txid += t_txid.elapsed();
+
         let mut total_output: i64 = 0;
 
         benefits.clear();
@@ -628,8 +639,12 @@ fn process_block(
         for (n, txout) in tx.output.iter().enumerate() {
             let amount = txout.value.to_sat() as i64;
             let spk    = &txout.script_pubkey;
+
+            let t_script = Instant::now();
             let stype  = script_type(spk);
             let address = script_address(spk);
+            t.p1_script += t_script.elapsed();
+
             total_output += amount;
 
             // Build output_id in place: txid + ':' + n
@@ -639,11 +654,14 @@ fn process_block(
             output_id.push_str(ibuf_n.format(n));
 
             // Hex-encode script into reusable buffer (no allocation)
+            let t_hex = Instant::now();
             let spk_bytes = spk.as_bytes();
             script_hex_buf.resize(spk_bytes.len() * 2, 0);
             hex::encode_to_slice(spk_bytes, &mut script_hex_buf).unwrap();
+            t.p1_hex += t_hex.elapsed();
 
             // Output node (isSpent=false; populated by post_import.cypher)
+            let t_wr = Instant::now();
             w.nodes_output.write_record(&[
                 output_id.as_bytes(), ibuf_n.format(n).as_bytes(),
                 ibuf_amt.format(amount).as_bytes(),
@@ -658,18 +676,21 @@ fn process_block(
                 e.0 += 1;
                 e.1 += amount;
             }
+            t.p1_csv_write += t_wr.elapsed();
 
             utxo_inserts.push((txid_bytes, n as u32, amount, address));
             t.n_outputs += 1;
         }
 
         // BENEFITS_TO – one relationship per unique recipient address per tx
+        let t_wr = Instant::now();
         for (addr, (cnt, received)) in &benefits {
             w.rels_benefits_to.write_record(&[
                 txid.as_bytes(), addr.as_bytes(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_rcv.format(*received).as_bytes(),
             ])?;
         }
+        t.p1_csv_write += t_wr.elapsed();
 
         tx_totals.push((txid, total_output));
     }
