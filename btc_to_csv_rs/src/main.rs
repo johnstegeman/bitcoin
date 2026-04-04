@@ -29,7 +29,7 @@ use rocksdb::{Options as RocksOptions, WriteBatch, DB as RocksDB};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -72,6 +72,12 @@ struct Args {
     /// Force re-index (re-scan all .blk files even if index already exists)
     #[arg(long, default_value = "false")]
     reindex: bool,
+
+    /// Use seek+read_exact per block instead of reading entire blk files.
+    /// Much faster on SSD/cloud disks where blocks are scattered across many files.
+    /// On HDD, leave this off (whole-file sequential reads avoid costly seeks).
+    #[arg(long, default_value = "false")]
+    ssd: bool,
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -1036,10 +1042,19 @@ fn main() -> Result<()> {
         }
     }
 
-    // Stage 1: I/O thread — reads blk files sequentially, capacity=2 so it
-    // stays one file ahead of the CPU thread.
+    // Stage 1: I/O thread — reads blk files, capacity=2 so it stays one file
+    // ahead of the CPU thread.
+    //
+    // --ssd mode: seek to each block's byte offset and read only its bytes,
+    // packing them contiguously.  Blocks are often scattered across many blk
+    // files (Bitcoin Core stores them in arrival order), so in --ssd mode we
+    // skip the gaps and read ~200× less data per 1000 blocks.
+    //
+    // Default mode: read the entire blk file in one sequential pass — optimal
+    // for spinning disks where seeks are expensive.
     struct FileMsg { blocks: Vec<(i64, i64, i64, String)>, contents: Vec<u8>, read_us: u64 }
     let (file_tx, file_rx) = mpsc::sync_channel::<anyhow::Result<FileMsg>>(2);
+    let ssd_mode = args.ssd;
     thread::spawn(move || {
         for FileGroup { file_path, blocks } in file_groups {
             let t_read = Instant::now();
@@ -1049,14 +1064,41 @@ fn main() -> Result<()> {
                 Ok(f) => f,
                 Err(e) => { let _ = file_tx.send(Err(e)); break; }
             };
-            let mut contents = Vec::new();
-            if let Err(e) = f.read_to_end(&mut contents)
-                .with_context(|| format!("read {file_path}"))
-            {
-                let _ = file_tx.send(Err(e)); break;
-            }
+
+            let (contents, adjusted_blocks) = if ssd_mode {
+                // Read only the bytes for each block; remap offsets into the
+                // packed buffer so the CPU thread slice logic is unchanged.
+                let total: usize = blocks.iter().map(|(_, _, sz, _)| *sz as usize).sum();
+                let mut contents = Vec::with_capacity(total);
+                let mut adjusted: Vec<(i64, i64, i64, String)> = Vec::with_capacity(blocks.len());
+                let mut ok = true;
+                for (height, byte_offset, block_size, hash) in &blocks {
+                    let new_offset = contents.len() as i64;
+                    let prev_len = contents.len();
+                    contents.resize(prev_len + *block_size as usize, 0u8);
+                    if let Err(e) = f.seek(std::io::SeekFrom::Start(*byte_offset as u64))
+                        .and_then(|_| f.read_exact(&mut contents[prev_len..]))
+                        .with_context(|| format!("seek/read {file_path} offset {byte_offset}"))
+                    {
+                        let _ = file_tx.send(Err(e)); ok = false; break;
+                    }
+                    adjusted.push((*height, new_offset, *block_size, hash.clone()));
+                }
+                if !ok { break; }
+                (contents, adjusted)
+            } else {
+                // Whole-file sequential read — best for HDD.
+                let mut contents = Vec::new();
+                if let Err(e) = f.read_to_end(&mut contents)
+                    .with_context(|| format!("read {file_path}"))
+                {
+                    let _ = file_tx.send(Err(e)); break;
+                }
+                (contents, blocks)
+            };
+
             let read_us = t_read.elapsed().as_micros() as u64;
-            if file_tx.send(Ok(FileMsg { blocks, contents, read_us })).is_err() { break; }
+            if file_tx.send(Ok(FileMsg { blocks: adjusted_blocks, contents, read_us })).is_err() { break; }
         }
     });
 
