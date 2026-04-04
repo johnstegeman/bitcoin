@@ -399,6 +399,9 @@ struct Timings {
     utxo_insert:  Duration, // in-memory UTXO cache insert (process_block)
     utxo_lookup:  Duration, // in-memory UTXO cache lookup (process_block pass 2)
     pass2_csv:    Duration, // pass 2: input/tx CSV writes (excl. lookup)
+    p2_witness:   Duration, //   └─ encode_witness per input
+    p2_prevtx:    Duration, //   └─ prev_txid hex formatting per non-coinbase input
+    p2_csv_write: Duration, //   └─ write_row calls
     utxo_delete:  Duration, // in-memory UTXO cache delete (process_block)
     commit:       Duration, // RocksDB WriteBatch + SQLite COMMIT + CSV flush
     checkpoint:   Duration, // UPDATE checkpoint row
@@ -437,6 +440,10 @@ impl Timings {
             "    utxo_look  {:>8.1}ms {:>5.1}%   pass2_csv  {:>8.1}ms {:>5.1}%",
             ms(self.utxo_lookup), pct(self.utxo_lookup),
             ms(self.pass2_csv),   pct(self.pass2_csv),
+        );
+        println!(
+            "      p2_witn  {:>8.1}ms   p2_prevtx {:>8.1}ms   p2_csv_wr {:>8.1}ms",
+            ms(self.p2_witness), ms(self.p2_prevtx), ms(self.p2_csv_write),
         );
         println!(
             "    utxo_del   {:>8.1}ms {:>5.1}%   commit     {:>8.1}ms {:>5.1}%   checkpoint {:>8.1}ms {:>5.1}%",
@@ -756,7 +763,10 @@ fn process_block(
 
         for (idx, txin) in tx.input.iter().enumerate() {
             let sequence = txin.sequence.0 as i64;
-            let witness  = encode_witness(&txin.witness);
+
+            let t_w = Instant::now();
+            let witness = encode_witness(&txin.witness);
+            t.p2_witness += t_w.elapsed();
 
             // input_id: txid + ':' + idx
             input_id.clear();
@@ -769,12 +779,14 @@ fn process_block(
             script_sig_buf.resize(sig_bytes.len() * 2, 0);
             hex::encode_to_slice(sig_bytes, &mut script_sig_buf).unwrap();
 
+            let t_wr = Instant::now();
             write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
                 &script_sig_buf, ibuf_seq.format(sequence).as_bytes(),
                 witness.as_bytes(),
             ])?;
             write_row(&mut w.rels_has_input, &[txid.as_bytes(), input_id.as_bytes()])?;
+            t.p2_csv_write += t_wr.elapsed();
             t.n_inputs += 1;
 
             if !is_coinbase {
@@ -783,11 +795,15 @@ fn process_block(
                 let prev_bytes = *prev_txid.as_byte_array();
 
                 // prev_out_id: prev_txid display + ':' + prev_vout
+                let t_p = Instant::now();
                 prev_out_id.clear();
                 use std::fmt::Write as FmtWrite;
                 write!(prev_out_id, "{}:{}", prev_txid, ibuf_pvout.format(prev_vout)).unwrap();
+                t.p2_prevtx += t_p.elapsed();
 
+                let t_wr = Instant::now();
                 write_row(&mut w.rels_spends, &[input_id.as_bytes(), prev_out_id.as_bytes()])?;
+                t.p2_csv_write += t_wr.elapsed();
 
                 match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
@@ -818,6 +834,7 @@ fn process_block(
         let tx_weight = tx.weight().to_wu() as i64;
         let coinbase_str = if is_coinbase { b"true" as &[u8] } else { b"false" };
 
+        let t_wr = Instant::now();
         write_row(&mut w.nodes_transaction, &[
             txid.as_bytes(), tb1.format(height).as_bytes(),
             block_hash.as_bytes(), time_str.as_bytes(),
@@ -836,6 +853,7 @@ fn process_block(
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_spt.format(*spent).as_bytes(),
             ])?;
         }
+        t.p2_csv_write += t_wr.elapsed();
     }
     t.pass2_csv += t0.elapsed();
 
