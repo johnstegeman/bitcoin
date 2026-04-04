@@ -1007,81 +1007,112 @@ fn main() -> Result<()> {
         }
     }
 
-    // Reader thread: load entire blk files into memory sequentially, eliminating
-    // per-block seeks on spinning disk. With 64 GB RAM and 128 MB blk files,
-    // peak memory usage is ~128 MB (one file) + channel buffer.
-    // read_us for the first block in each file includes the full file read;
-    // subsequent blocks from the same file report near-zero read time.
-    let (tx, rx) = mpsc::sync_channel::<anyhow::Result<BlockMsg>>(8);
-    thread::spawn(move || {
-        // (file_path, file_contents) — holds one blk file at a time
-        let mut cached: Option<(String, Vec<u8>)> = None;
+    // Two-stage pipeline to overlap HDD I/O with CPU (rayon) work:
+    //   Stage 1 – I/O thread:  reads one blk file at a time, sends raw bytes.
+    //   Stage 2 – CPU thread:  decodes blocks + rayon par_iter, sends BlockMsg.
+    //   Main thread:           processes BlockMsg (UTXO cache, CSV writes).
+    //
+    // While Stage 2 is crunching file N, Stage 1 pre-fetches file N+1,
+    // keeping rayon busy and eliminating idle time during HDD reads.
 
-        for (height, file_path, byte_offset, block_size, hash) in block_metas {
-            // Load the blk file into memory when the path changes
+    // Group block_metas by blk file (already height-ordered, files are consecutive).
+    struct FileGroup {
+        file_path: String,
+        blocks:    Vec<(i64, i64, i64, String)>, // (height, byte_offset, block_size, hash)
+    }
+    let mut file_groups: Vec<FileGroup> = Vec::new();
+    for (height, file_path, byte_offset, block_size, hash) in block_metas {
+        match file_groups.last_mut() {
+            Some(g) if g.file_path == file_path => {
+                g.blocks.push((height, byte_offset, block_size, hash));
+            }
+            _ => file_groups.push(FileGroup {
+                file_path,
+                blocks: vec![(height, byte_offset, block_size, hash)],
+            }),
+        }
+    }
+
+    // Stage 1: I/O thread — reads blk files sequentially, capacity=2 so it
+    // stays one file ahead of the CPU thread.
+    struct FileMsg { blocks: Vec<(i64, i64, i64, String)>, contents: Vec<u8>, read_us: u64 }
+    let (file_tx, file_rx) = mpsc::sync_channel::<anyhow::Result<FileMsg>>(2);
+    thread::spawn(move || {
+        for FileGroup { file_path, blocks } in file_groups {
             let t_read = Instant::now();
-            let need_load = cached.as_ref().map(|(p, _)| p != &file_path).unwrap_or(true);
-            if need_load {
-                let mut f = match File::open(&file_path)
-                    .with_context(|| format!("open {file_path}"))
-                {
-                    Ok(f) => f,
-                    Err(e) => { let _ = tx.send(Err(e)); break; }
-                };
-                let mut contents = Vec::new();
-                if let Err(e) = f.read_to_end(&mut contents)
-                    .with_context(|| format!("read {file_path}"))
-                {
-                    let _ = tx.send(Err(e)); break;
-                }
-                cached = Some((file_path, contents));
+            let mut f = match File::open(&file_path)
+                .with_context(|| format!("open {file_path}"))
+            {
+                Ok(f) => f,
+                Err(e) => { let _ = file_tx.send(Err(e)); break; }
+            };
+            let mut contents = Vec::new();
+            if let Err(e) = f.read_to_end(&mut contents)
+                .with_context(|| format!("read {file_path}"))
+            {
+                let _ = file_tx.send(Err(e)); break;
             }
             let read_us = t_read.elapsed().as_micros() as u64;
+            if file_tx.send(Ok(FileMsg { blocks, contents, read_us })).is_err() { break; }
+        }
+    });
 
-            let contents = &cached.as_ref().unwrap().1;
-            let start = byte_offset as usize;
-            let end   = start + block_size as usize;
+    // Stage 2: CPU thread — decodes + rayon par_iter per block, no I/O.
+    let (tx, rx) = mpsc::sync_channel::<anyhow::Result<BlockMsg>>(8);
+    thread::spawn(move || {
+        for file_msg in file_rx {
+            let FileMsg { blocks, contents, read_us } = match file_msg {
+                Ok(m) => m,
+                Err(e) => { let _ = tx.send(Err(e)); break; }
+            };
+            // Charge the full file read_us to the first block; rest report 0.
+            for (i, (height, byte_offset, block_size, hash)) in blocks.into_iter().enumerate() {
+                let block_read_us = if i == 0 { read_us } else { 0 };
+                let start = byte_offset as usize;
+                let end   = start + block_size as usize;
 
-            let t_dec = Instant::now();
-            let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
-                .with_context(|| format!("decoding block {height}"))
-                .map(|block| {
-                    let (txids, meta_pairs): (Vec<_>, Vec<(Vec<OutputMeta>, Vec<InputMeta>)>) =
-                        block.txdata.par_iter().map(|tx| {
-                            let txid = tx.compute_txid();
-                            let out_metas = tx.output.iter().map(|txout| {
-                                let spk = &txout.script_pubkey;
-                                OutputMeta { stype: script_type(spk), address: script_address(spk) }
-                            }).collect();
-                            let in_metas = tx.input.iter().map(|txin| {
-                                let witness = encode_witness(&txin.witness);
-                                let mut bytes = *txin.previous_output.txid.as_byte_array();
-                                bytes.reverse(); // internal→display order
-                                let mut prev_txid_hex = [0u8; 64];
-                                hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
-                                let sig_bytes = txin.script_sig.as_bytes();
-                                let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
-                                hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
-                                InputMeta { witness, prev_txid_hex, script_sig_hex }
-                            }).collect();
-                            (txid, (out_metas, in_metas))
-                        }).unzip();
-                    let txid_hexes: Vec<[u8; 64]> = txids.iter().map(|txid| {
-                        let mut bytes = *txid.as_byte_array();
-                        bytes.reverse(); // internal→display order
-                        let mut hex = [0u8; 64];
-                        hex::encode_to_slice(&bytes, &mut hex).unwrap();
-                        hex
-                    }).collect();
-                    let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
-                    BlockMsg {
-                        height, block, hash, read_us,
-                        decode_us: t_dec.elapsed().as_micros() as u64,
-                        txids, txid_hexes, output_metas, input_metas,
-                    }
-                });
+                let t_dec = Instant::now();
+                let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
+                    .with_context(|| format!("decoding block {height}"))
+                    .map(|block| {
+                        let (txids, meta_pairs): (Vec<_>, Vec<(Vec<OutputMeta>, Vec<InputMeta>)>) =
+                            block.txdata.par_iter().map(|tx| {
+                                let txid = tx.compute_txid();
+                                let out_metas = tx.output.iter().map(|txout| {
+                                    let spk = &txout.script_pubkey;
+                                    OutputMeta { stype: script_type(spk), address: script_address(spk) }
+                                }).collect();
+                                let in_metas = tx.input.iter().map(|txin| {
+                                    let witness = encode_witness(&txin.witness);
+                                    let mut bytes = *txin.previous_output.txid.as_byte_array();
+                                    bytes.reverse();
+                                    let mut prev_txid_hex = [0u8; 64];
+                                    hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
+                                    let sig_bytes = txin.script_sig.as_bytes();
+                                    let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
+                                    hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
+                                    InputMeta { witness, prev_txid_hex, script_sig_hex }
+                                }).collect();
+                                (txid, (out_metas, in_metas))
+                            }).unzip();
+                        let txid_hexes: Vec<[u8; 64]> = txids.iter().map(|txid| {
+                            let mut bytes = *txid.as_byte_array();
+                            bytes.reverse();
+                            let mut hex = [0u8; 64];
+                            hex::encode_to_slice(&bytes, &mut hex).unwrap();
+                            hex
+                        }).collect();
+                        let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
+                        BlockMsg {
+                            height, block, hash,
+                            read_us: block_read_us,
+                            decode_us: t_dec.elapsed().as_micros() as u64,
+                            txids, txid_hexes, output_metas, input_metas,
+                        }
+                    });
 
-            if tx.send(msg).is_err() { break; }
+                if tx.send(msg).is_err() { break; }
+            }
         }
     });
 
