@@ -789,12 +789,22 @@ fn process_block(
             let prev_bytes = *txin.previous_output.txid.as_byte_array();
             let prev_vout  = txin.previous_output.vout;
 
-            // input_id: txid + ':' + idx (no String allocation for txid)
+            // input_id: txid + ':' + idx
             input_id.clear();
             input_id.push_str(unsafe { std::str::from_utf8_unchecked(txid_hex) });
             input_id.push(':');
             input_id.push_str(ibuf_idx.format(idx));
 
+            // Build prev_out_id before the write bracket so all 3 rows share
+            // one Instant::now() instead of two (halves timing call overhead).
+            if !is_coinbase {
+                prev_out_id.clear();
+                prev_out_id.push_str(unsafe { std::str::from_utf8_unchecked(&meta.prev_txid_hex) });
+                prev_out_id.push(':');
+                prev_out_id.push_str(ibuf_pvout.format(prev_vout));
+            }
+
+            // All three write_rows in one timed bracket.
             let t_wr = Instant::now();
             write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
@@ -802,20 +812,15 @@ fn process_block(
                 witness.as_bytes(),
             ])?;
             write_row(&mut w.rels_has_input, &[txid_hex.as_ref(), input_id.as_bytes()])?;
+            if !is_coinbase {
+                write_row(&mut w.rels_spends, &[input_id.as_bytes(), prev_out_id.as_bytes()])?;
+            }
             t.p2_csv_write += t_wr.elapsed();
             t.n_inputs += 1;
 
+            // UTXO lookup — timed separately using the existing utxo_lookup timer.
             if !is_coinbase {
-                // prev_out_id from precomputed hex: no fmt::Write, no allocation
-                prev_out_id.clear();
-                prev_out_id.push_str(unsafe { std::str::from_utf8_unchecked(&meta.prev_txid_hex) });
-                prev_out_id.push(':');
-                prev_out_id.push_str(ibuf_pvout.format(prev_vout));
-
-                let t_wr = Instant::now();
-                write_row(&mut w.rels_spends, &[input_id.as_bytes(), prev_out_id.as_bytes()])?;
-                t.p2_csv_write += t_wr.elapsed();
-
+                let t_ul = Instant::now();
                 match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
                         total_input += amt;
@@ -829,8 +834,8 @@ fn process_block(
                         eprintln!("  WARN block {height}: UTXO not found {:?}:{}", prev_bytes, prev_vout);
                     }
                 }
-
                 utxo_deletes.push((prev_bytes, prev_vout));
+                t.utxo_lookup += t_ul.elapsed();
             }
         }
 
