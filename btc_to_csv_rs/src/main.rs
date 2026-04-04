@@ -24,6 +24,7 @@
  */
 
 use itoa::Buffer as ItoaBuf;
+use rayon::prelude::*;
 use rocksdb::{Options as RocksOptions, WriteBatch, DB as RocksDB};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
@@ -1020,13 +1021,17 @@ fn main() -> Result<()> {
             let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
                 .with_context(|| format!("decoding block {height}"))
                 .map(|block| {
-                    let txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
-                    let output_metas: Vec<Vec<OutputMeta>> = block.txdata.iter().map(|tx| {
-                        tx.output.iter().map(|txout| {
-                            let spk = &txout.script_pubkey;
-                            OutputMeta { stype: script_type(spk), address: script_address(spk) }
-                        }).collect()
-                    }).collect();
+                    let (txids, output_metas): (Vec<_>, Vec<Vec<OutputMeta>>) = block.txdata
+                        .par_iter()
+                        .map(|tx| {
+                            let txid = tx.compute_txid();
+                            let metas = tx.output.iter().map(|txout| {
+                                let spk = &txout.script_pubkey;
+                                OutputMeta { stype: script_type(spk), address: script_address(spk) }
+                            }).collect();
+                            (txid, metas)
+                        })
+                        .unzip();
                     BlockMsg {
                         height, block, hash, read_us,
                         decode_us: t_dec.elapsed().as_micros() as u64,
