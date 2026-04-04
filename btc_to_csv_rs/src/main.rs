@@ -987,10 +987,15 @@ fn main() -> Result<()> {
     // Transient UTXOs (inserted and spent within the same batch) cancel out
     // in process_block and never reach RocksDB, saving ~40% of write traffic.
     let batch_cap = COMMIT_EVERY as usize;
+    // At block 400k+, blocks have ~3.5-4M outputs per 1000 blocks.
+    // A 2000-block batch generates ~7-8M outputs; pending_inserts holds the
+    // non-transient subset (~60-70%) = up to ~5.5M entries. Pre-size to 8M
+    // to avoid any mid-batch resize (which rehashes all entries).
+    // pending_deletes holds the non-transient inputs (~4-5M); pre-size to 8M.
     let mut pending_inserts: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
-        FxHashMap::with_capacity_and_hasher(batch_cap * 1500, Default::default());
+        FxHashMap::with_capacity_and_hasher(batch_cap * 4000, Default::default());
     let mut pending_deletes: FxHashSet<([u8; 32], u32)> =
-        FxHashSet::with_capacity_and_hasher(batch_cap * 1200, Default::default());
+        FxHashSet::with_capacity_and_hasher(batch_cap * 4000, Default::default());
 
     // ── Reader thread: pre-fetch + decode blocks, overlapping disk I/O with
     //    the main thread's UTXO/CSV/RocksDB work. ─────────────────────────────
