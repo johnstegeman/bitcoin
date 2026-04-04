@@ -255,6 +255,7 @@ struct OutputMeta {
 struct InputMeta {
     witness:       String,   // semicolon-separated hex witness items (pre-encoded)
     prev_txid_hex: [u8; 64], // display-order ASCII hex of prev txid (no allocation)
+    script_sig_hex: Vec<u8>, // hex-encoded scriptSig bytes (pre-encoded, variable length)
 }
 
 struct BlockMsg {
@@ -264,6 +265,7 @@ struct BlockMsg {
     read_us:      u64,
     decode_us:    u64,
     txids:        Vec<bitcoin::Txid>,
+    txid_hexes:   Vec<[u8; 64]>,        // display-order ASCII hex per tx (no String alloc)
     output_metas: Vec<Vec<OutputMeta>>, // [tx_idx][output_idx]
     input_metas:  Vec<Vec<InputMeta>>,  // [tx_idx][input_idx]
 }
@@ -598,6 +600,7 @@ fn assign_heights(db: &Connection) -> Result<()> {
 fn process_block(
     block: &Block,
     txids: &[bitcoin::Txid],
+    txid_hexes: &[[u8; 64]],
     output_metas: Vec<Vec<OutputMeta>>,
     input_metas: Vec<Vec<InputMeta>>,
     height: i64,
@@ -641,8 +644,8 @@ fn process_block(
     // SAME block can look up UTXOs created by earlier transactions.
     // ─────────────────────────────────────────────────────────────────────
 
-    // (txid, total_output) carried forward to Pass 2
-    let mut tx_totals: Vec<(String, i64)> = Vec::with_capacity(block.txdata.len());
+    // (txid_hex, total_output) carried forward to Pass 2
+    let mut tx_totals: Vec<([u8; 64], i64)> = Vec::with_capacity(block.txdata.len());
 
     let mut utxo_inserts: Vec<([u8; 32], u32, i64, Option<String>)> =
         Vec::with_capacity(block.txdata.len() * 2);
@@ -657,10 +660,14 @@ fn process_block(
     let mut ibuf_rcv = ItoaBuf::new();
 
     let t0 = Instant::now();
-    for ((tx, txid_obj), tx_metas) in block.txdata.iter().zip(txids.iter()).zip(output_metas.into_iter()) {
+    for (((tx, txid_obj), txid_hex), tx_metas) in block.txdata.iter()
+        .zip(txids.iter())
+        .zip(txid_hexes.iter())
+        .zip(output_metas.into_iter())
+    {
         let t_txid = Instant::now();
-        let txid       = txid_obj.to_string();      // hex string – for CSV
         let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for cache
+        // txid_hex is &[u8; 64] — ASCII hex, no String allocation needed
         t.p1_txid += t_txid.elapsed();
 
         let mut total_output: i64 = 0;
@@ -675,9 +682,9 @@ fn process_block(
 
             total_output += amount;
 
-            // Build output_id in place: txid + ':' + n
+            // Build output_id in place: txid_hex + ':' + n (no String allocation for txid)
             output_id.clear();
-            output_id.push_str(&txid);
+            output_id.push_str(unsafe { std::str::from_utf8_unchecked(txid_hex) });
             output_id.push(':');
             output_id.push_str(ibuf_n.format(n));
 
@@ -695,7 +702,7 @@ fn process_block(
                 ibuf_amt.format(amount).as_bytes(),
                 &script_hex_buf, stype.as_bytes(), b"false", b"", b"",
             ])?;
-            write_row(&mut w.rels_has_output, &[txid.as_bytes(), output_id.as_bytes()])?;
+            write_row(&mut w.rels_has_output, &[txid_hex.as_ref(), output_id.as_bytes()])?;
 
             if let Some(ref addr) = address {
                 write_row(&mut w.nodes_address, &[addr.as_bytes()])?;
@@ -714,13 +721,13 @@ fn process_block(
         let t_wr = Instant::now();
         for (addr, (cnt, received)) in &benefits {
             write_row(&mut w.rels_benefits_to, &[
-                txid.as_bytes(), addr.as_bytes(),
+                txid_hex.as_ref(), addr.as_bytes(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_rcv.format(*received).as_bytes(),
             ])?;
         }
         t.p1_csv_write += t_wr.elapsed();
 
-        tx_totals.push((txid, total_output));
+        tx_totals.push((*txid_hex, total_output));
     }
     t.pass1_csv += t0.elapsed();
 
@@ -749,7 +756,6 @@ fn process_block(
     let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
     let mut input_id      = String::with_capacity(80);
     let mut prev_out_id   = String::with_capacity(80);
-    let mut script_sig_buf: Vec<u8> = Vec::with_capacity(202);
     let mut ibuf_idx   = ItoaBuf::new();
     let mut ibuf_seq   = ItoaBuf::new();
     let mut ibuf_pvout = ItoaBuf::new();
@@ -762,7 +768,7 @@ fn process_block(
     let mut ibuf_spt = ItoaBuf::new();
 
     let t0 = Instant::now();
-    for ((tx, (txid, total_output)), tx_in_metas) in
+    for ((tx, (txid_hex, total_output)), tx_in_metas) in
         block.txdata.iter().zip(tx_totals.iter()).zip(input_metas.into_iter())
     {
         let is_coinbase = tx.is_coinbase();
@@ -776,26 +782,19 @@ fn process_block(
             let prev_bytes = *txin.previous_output.txid.as_byte_array();
             let prev_vout  = txin.previous_output.vout;
 
-            // input_id: txid + ':' + idx
+            // input_id: txid + ':' + idx (no String allocation for txid)
             input_id.clear();
-            input_id.push_str(txid);
+            input_id.push_str(unsafe { std::str::from_utf8_unchecked(txid_hex) });
             input_id.push(':');
             input_id.push_str(ibuf_idx.format(idx));
-
-            // script_sig hex into reusable buffer
-            let t_sh = Instant::now();
-            let sig_bytes = txin.script_sig.as_bytes();
-            script_sig_buf.resize(sig_bytes.len() * 2, 0);
-            hex::encode_to_slice(sig_bytes, &mut script_sig_buf).unwrap();
-            t.p2_sig_hex += t_sh.elapsed();
 
             let t_wr = Instant::now();
             write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
-                &script_sig_buf, ibuf_seq.format(sequence).as_bytes(),
+                &meta.script_sig_hex, ibuf_seq.format(sequence).as_bytes(),
                 witness.as_bytes(),
             ])?;
-            write_row(&mut w.rels_has_input, &[txid.as_bytes(), input_id.as_bytes()])?;
+            write_row(&mut w.rels_has_input, &[txid_hex.as_ref(), input_id.as_bytes()])?;
             t.p2_csv_write += t_wr.elapsed();
             t.n_inputs += 1;
 
@@ -844,7 +843,7 @@ fn process_block(
 
         let t_wr = Instant::now();
         write_row(&mut w.nodes_transaction, &[
-            txid.as_bytes(), tb1.format(height).as_bytes(),
+            txid_hex.as_ref(), tb1.format(height).as_bytes(),
             block_hash.as_bytes(), time_str.as_bytes(),
             tb2.format(total_input).as_bytes(), tb3.format(*total_output).as_bytes(),
             tb4.format(fee).as_bytes(), tb5.format(tx_size).as_bytes(),
@@ -853,11 +852,11 @@ fn process_block(
             tb9.format(tx.lock_time.to_consensus_u32()).as_bytes(),
             coinbase_str,
         ])?;
-        write_row(&mut w.rels_included_in, &[txid.as_bytes(), block_hash.as_bytes()])?;
+        write_row(&mut w.rels_included_in, &[txid_hex.as_ref(), block_hash.as_bytes()])?;
 
         for (addr, (cnt, spent)) in &performs {
             write_row(&mut w.rels_performs, &[
-                addr.as_bytes(), txid.as_bytes(),
+                addr.as_bytes(), txid_hex.as_ref(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_spt.format(*spent).as_bytes(),
             ])?;
         }
@@ -1060,15 +1059,25 @@ fn main() -> Result<()> {
                                 bytes.reverse(); // internal→display order
                                 let mut prev_txid_hex = [0u8; 64];
                                 hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
-                                InputMeta { witness, prev_txid_hex }
+                                let sig_bytes = txin.script_sig.as_bytes();
+                                let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
+                                hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
+                                InputMeta { witness, prev_txid_hex, script_sig_hex }
                             }).collect();
                             (txid, (out_metas, in_metas))
                         }).unzip();
+                    let txid_hexes: Vec<[u8; 64]> = txids.iter().map(|txid| {
+                        let mut bytes = *txid.as_byte_array();
+                        bytes.reverse(); // internal→display order
+                        let mut hex = [0u8; 64];
+                        hex::encode_to_slice(&bytes, &mut hex).unwrap();
+                        hex
+                    }).collect();
                     let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
                     BlockMsg {
                         height, block, hash, read_us,
                         decode_us: t_dec.elapsed().as_micros() as u64,
-                        txids, output_metas, input_metas,
+                        txids, txid_hexes, output_metas, input_metas,
                     }
                 });
 
@@ -1079,11 +1088,11 @@ fn main() -> Result<()> {
     db.execute("BEGIN", [])?;
 
     for msg in rx {
-        let BlockMsg { height, block, hash, read_us, decode_us, txids, output_metas, input_metas } = msg?;
+        let BlockMsg { height, block, hash, read_us, decode_us, txids, txid_hexes, output_metas, input_metas } = msg?;
         timings.read   += Duration::from_micros(read_us);
         timings.decode += Duration::from_micros(decode_us);
 
-        process_block(&block, &txids, output_metas, input_metas, height, prev_block_hash.as_deref(), &mut w,
+        process_block(&block, &txids, &txid_hexes, output_metas, input_metas, height, prev_block_hash.as_deref(), &mut w,
                       &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
