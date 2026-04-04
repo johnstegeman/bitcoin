@@ -757,8 +757,6 @@ fn process_block(
     //         nodes, Input nodes, and PERFORMS/SPENDS relationships.
     // ─────────────────────────────────────────────────────────────────────
 
-    let mut utxo_deletes: Vec<([u8; 32], u32)> = Vec::new();
-
     // Reusable per-block buffers for pass 2 — same pattern as pass 1.
     let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
     let mut input_id      = String::with_capacity(80);
@@ -818,10 +816,14 @@ fn process_block(
             t.p2_csv_write += t_wr.elapsed();
             t.n_inputs += 1;
 
-            // UTXO lookup — timed separately using the existing utxo_lookup timer.
+            // Single remove() instead of get() + deferred remove() — halves
+            // utxo_cache hash operations per spent UTXO (was 2, now 1).
+            // pending_inserts/pending_deletes are also handled inline,
+            // eliminating the separate utxo_del post-loop entirely.
             if !is_coinbase {
+                let key = (prev_bytes, prev_vout);
                 let t_ul = Instant::now();
-                match utxo_cache.get(&(prev_bytes, prev_vout)) {
+                match utxo_cache.remove(&key) {
                     Some((amt, addr)) => {
                         total_input += amt;
                         if let Some(a) = addr {
@@ -829,12 +831,14 @@ fn process_block(
                             e.0 += 1;
                             e.1 += amt;
                         }
+                        if pending_inserts.remove(&key).is_none() {
+                            pending_deletes.insert(key);
+                        }
                     }
                     None => {
                         eprintln!("  WARN block {height}: UTXO not found {:?}:{}", prev_bytes, prev_vout);
                     }
                 }
-                utxo_deletes.push((prev_bytes, prev_vout));
                 t.utxo_lookup += t_ul.elapsed();
             }
         }
@@ -875,21 +879,6 @@ fn process_block(
         t.p2_csv_write += t_wr.elapsed();
     }
     t.pass2_csv += t0.elapsed();
-
-    // Remove spent UTXOs from the in-memory cache and from the deferred maps.
-    // If the UTXO was inserted this batch (pending_inserts contains it), it's
-    // transient and needs no SQLite work at all — just drop it from both maps.
-    // Otherwise mark it for SQLite DELETE at commit time.
-    let t0 = Instant::now();
-    for (txid_bytes, vout) in utxo_deletes.drain(..) {
-        let key = (txid_bytes, vout);
-        if pending_inserts.remove(&key).is_none() {
-            // Pre-existing UTXO (from a prior batch, already in SQLite)
-            pending_deletes.insert(key);
-        }
-        utxo_cache.remove(&key);
-    }
-    t.utxo_delete += t0.elapsed();
 
     t.n_blocks += 1;
     Ok(())
