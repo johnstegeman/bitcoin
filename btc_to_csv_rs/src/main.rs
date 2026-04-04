@@ -252,6 +252,11 @@ struct OutputMeta {
     address: Option<String>,
 }
 
+struct InputMeta {
+    witness:       String,   // semicolon-separated hex witness items (pre-encoded)
+    prev_txid_hex: [u8; 64], // display-order ASCII hex of prev txid (no allocation)
+}
+
 struct BlockMsg {
     height:       i64,
     block:        Block,
@@ -260,6 +265,7 @@ struct BlockMsg {
     decode_us:    u64,
     txids:        Vec<bitcoin::Txid>,
     output_metas: Vec<Vec<OutputMeta>>, // [tx_idx][output_idx]
+    input_metas:  Vec<Vec<InputMeta>>,  // [tx_idx][input_idx]
 }
 
 // ─── Header files ─────────────────────────────────────────────────────────────
@@ -399,8 +405,8 @@ struct Timings {
     utxo_insert:  Duration, // in-memory UTXO cache insert (process_block)
     utxo_lookup:  Duration, // in-memory UTXO cache lookup (process_block pass 2)
     pass2_csv:    Duration, // pass 2: input/tx CSV writes (excl. lookup)
-    p2_witness:   Duration, //   └─ encode_witness per input
-    p2_prevtx:    Duration, //   └─ prev_txid hex formatting per non-coinbase input
+    p2_sig_hex:   Duration, //   └─ script_sig hex encoding per input
+    p2_tx_size:   Duration, //   └─ tx.total_size/vsize/weight per tx
     p2_csv_write: Duration, //   └─ write_row calls
     utxo_delete:  Duration, // in-memory UTXO cache delete (process_block)
     commit:       Duration, // RocksDB WriteBatch + SQLite COMMIT + CSV flush
@@ -442,8 +448,8 @@ impl Timings {
             ms(self.pass2_csv),   pct(self.pass2_csv),
         );
         println!(
-            "      p2_witn  {:>8.1}ms   p2_prevtx {:>8.1}ms   p2_csv_wr {:>8.1}ms",
-            ms(self.p2_witness), ms(self.p2_prevtx), ms(self.p2_csv_write),
+            "      p2_sighx {:>8.1}ms   p2_txsize {:>8.1}ms   p2_csv_wr {:>8.1}ms",
+            ms(self.p2_sig_hex), ms(self.p2_tx_size), ms(self.p2_csv_write),
         );
         println!(
             "    utxo_del   {:>8.1}ms {:>5.1}%   commit     {:>8.1}ms {:>5.1}%   checkpoint {:>8.1}ms {:>5.1}%",
@@ -593,6 +599,7 @@ fn process_block(
     block: &Block,
     txids: &[bitcoin::Txid],
     output_metas: Vec<Vec<OutputMeta>>,
+    input_metas: Vec<Vec<InputMeta>>,
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
@@ -755,18 +762,19 @@ fn process_block(
     let mut ibuf_spt = ItoaBuf::new();
 
     let t0 = Instant::now();
-    for (tx, (txid, total_output)) in block.txdata.iter().zip(tx_totals.iter()) {
+    for ((tx, (txid, total_output)), tx_in_metas) in
+        block.txdata.iter().zip(tx_totals.iter()).zip(input_metas.into_iter())
+    {
         let is_coinbase = tx.is_coinbase();
         let mut total_input: i64 = 0;
 
         performs.clear();
 
-        for (idx, txin) in tx.input.iter().enumerate() {
-            let sequence = txin.sequence.0 as i64;
-
-            let t_w = Instant::now();
-            let witness = encode_witness(&txin.witness);
-            t.p2_witness += t_w.elapsed();
+        for ((idx, txin), meta) in tx.input.iter().enumerate().zip(tx_in_metas.into_iter()) {
+            let sequence  = txin.sequence.0 as i64;
+            let witness   = meta.witness;
+            let prev_bytes = *txin.previous_output.txid.as_byte_array();
+            let prev_vout  = txin.previous_output.vout;
 
             // input_id: txid + ':' + idx
             input_id.clear();
@@ -775,9 +783,11 @@ fn process_block(
             input_id.push_str(ibuf_idx.format(idx));
 
             // script_sig hex into reusable buffer
+            let t_sh = Instant::now();
             let sig_bytes = txin.script_sig.as_bytes();
             script_sig_buf.resize(sig_bytes.len() * 2, 0);
             hex::encode_to_slice(sig_bytes, &mut script_sig_buf).unwrap();
+            t.p2_sig_hex += t_sh.elapsed();
 
             let t_wr = Instant::now();
             write_row(&mut w.nodes_input, &[
@@ -790,16 +800,11 @@ fn process_block(
             t.n_inputs += 1;
 
             if !is_coinbase {
-                let prev_txid = &txin.previous_output.txid;
-                let prev_vout = txin.previous_output.vout;
-                let prev_bytes = *prev_txid.as_byte_array();
-
-                // prev_out_id: prev_txid display + ':' + prev_vout
-                let t_p = Instant::now();
+                // prev_out_id from precomputed hex: no fmt::Write, no allocation
                 prev_out_id.clear();
-                use std::fmt::Write as FmtWrite;
-                write!(prev_out_id, "{}:{}", prev_txid, ibuf_pvout.format(prev_vout)).unwrap();
-                t.p2_prevtx += t_p.elapsed();
+                prev_out_id.push_str(unsafe { std::str::from_utf8_unchecked(&meta.prev_txid_hex) });
+                prev_out_id.push(':');
+                prev_out_id.push_str(ibuf_pvout.format(prev_vout));
 
                 let t_wr = Instant::now();
                 write_row(&mut w.rels_spends, &[input_id.as_bytes(), prev_out_id.as_bytes()])?;
@@ -815,7 +820,7 @@ fn process_block(
                         }
                     }
                     None => {
-                        eprintln!("  WARN block {height}: UTXO not found {}:{}", prev_txid, prev_vout);
+                        eprintln!("  WARN block {height}: UTXO not found {:?}:{}", prev_bytes, prev_vout);
                     }
                 }
 
@@ -829,9 +834,12 @@ fn process_block(
             (total_input, total_input - total_output)
         };
 
+        let t_sz = Instant::now();
         let tx_size   = tx.total_size() as i64;
         let tx_vsize  = tx.vsize() as i64;
         let tx_weight = tx.weight().to_wu() as i64;
+        t.p2_tx_size += t_sz.elapsed();
+
         let coinbase_str = if is_coinbase { b"true" as &[u8] } else { b"false" };
 
         let t_wr = Instant::now();
@@ -1039,21 +1047,28 @@ fn main() -> Result<()> {
             let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
                 .with_context(|| format!("decoding block {height}"))
                 .map(|block| {
-                    let (txids, output_metas): (Vec<_>, Vec<Vec<OutputMeta>>) = block.txdata
-                        .par_iter()
-                        .map(|tx| {
+                    let (txids, meta_pairs): (Vec<_>, Vec<(Vec<OutputMeta>, Vec<InputMeta>)>) =
+                        block.txdata.par_iter().map(|tx| {
                             let txid = tx.compute_txid();
-                            let metas = tx.output.iter().map(|txout| {
+                            let out_metas = tx.output.iter().map(|txout| {
                                 let spk = &txout.script_pubkey;
                                 OutputMeta { stype: script_type(spk), address: script_address(spk) }
                             }).collect();
-                            (txid, metas)
-                        })
-                        .unzip();
+                            let in_metas = tx.input.iter().map(|txin| {
+                                let witness = encode_witness(&txin.witness);
+                                let mut bytes = *txin.previous_output.txid.as_byte_array();
+                                bytes.reverse(); // internal→display order
+                                let mut prev_txid_hex = [0u8; 64];
+                                hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
+                                InputMeta { witness, prev_txid_hex }
+                            }).collect();
+                            (txid, (out_metas, in_metas))
+                        }).unzip();
+                    let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
                     BlockMsg {
                         height, block, hash, read_us,
                         decode_us: t_dec.elapsed().as_micros() as u64,
-                        txids, output_metas,
+                        txids, output_metas, input_metas,
                     }
                 });
 
@@ -1064,11 +1079,11 @@ fn main() -> Result<()> {
     db.execute("BEGIN", [])?;
 
     for msg in rx {
-        let BlockMsg { height, block, hash, read_us, decode_us, txids, output_metas } = msg?;
+        let BlockMsg { height, block, hash, read_us, decode_us, txids, output_metas, input_metas } = msg?;
         timings.read   += Duration::from_micros(read_us);
         timings.decode += Duration::from_micros(decode_us);
 
-        process_block(&block, &txids, output_metas, height, prev_block_hash.as_deref(), &mut w,
+        process_block(&block, &txids, output_metas, input_metas, height, prev_block_hash.as_deref(), &mut w,
                       &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
