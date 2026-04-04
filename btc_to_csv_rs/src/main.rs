@@ -252,6 +252,7 @@ struct BlockMsg {
     hash:      String,
     read_us:   u64,
     decode_us: u64,
+    txids:     Vec<bitcoin::Txid>,
 }
 
 // ─── Header files ─────────────────────────────────────────────────────────────
@@ -289,6 +290,17 @@ const HEADERS: &[(&str, &[&str])] = &[
     ("rels_benefits_to", &[":START_ID(Transaction)", ":END_ID(Address)", "outputCount:int", "amountReceived:long"]),
 ];
 
+/// Write one CSV row directly to a BufWriter — no escaping, since Bitcoin
+/// data (hex, base58/bech32, integers) never contains commas, quotes, or newlines.
+#[inline]
+fn write_row(w: &mut impl Write, fields: &[&[u8]]) -> io::Result<()> {
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 { w.write_all(b",")?; }
+        w.write_all(f)?;
+    }
+    w.write_all(b"\n")
+}
+
 fn write_headers(output_dir: &Path) -> Result<()> {
     for (name, cols) in HEADERS {
         let path = output_dir.join(format!("{name}-header.csv"));
@@ -303,32 +315,29 @@ fn write_headers(output_dir: &Path) -> Result<()> {
 // ─── CSV writers ──────────────────────────────────────────────────────────────
 
 struct Writers {
-    nodes_block:      csv::Writer<BufWriter<File>>,
-    nodes_transaction:csv::Writer<BufWriter<File>>,
-    nodes_output:     csv::Writer<BufWriter<File>>,
-    nodes_input:      csv::Writer<BufWriter<File>>,
-    nodes_address:    csv::Writer<BufWriter<File>>,
-    rels_next_block:  csv::Writer<BufWriter<File>>,
-    rels_included_in: csv::Writer<BufWriter<File>>,
-    rels_has_input:   csv::Writer<BufWriter<File>>,
-    rels_has_output:  csv::Writer<BufWriter<File>>,
-    rels_spends:      csv::Writer<BufWriter<File>>,
-    rels_locked_to:   csv::Writer<BufWriter<File>>,
-    rels_performs:    csv::Writer<BufWriter<File>>,
-    rels_benefits_to: csv::Writer<BufWriter<File>>,
+    nodes_block:      BufWriter<File>,
+    nodes_transaction:BufWriter<File>,
+    nodes_output:     BufWriter<File>,
+    nodes_input:      BufWriter<File>,
+    nodes_address:    BufWriter<File>,
+    rels_next_block:  BufWriter<File>,
+    rels_included_in: BufWriter<File>,
+    rels_has_input:   BufWriter<File>,
+    rels_has_output:  BufWriter<File>,
+    rels_spends:      BufWriter<File>,
+    rels_locked_to:   BufWriter<File>,
+    rels_performs:    BufWriter<File>,
+    rels_benefits_to: BufWriter<File>,
 }
 
-fn open_writer(path: &Path, append: bool) -> Result<csv::Writer<BufWriter<File>>> {
+fn open_writer(path: &Path, append: bool) -> Result<BufWriter<File>> {
     let file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .append(append)
         .truncate(!append)
         .open(path)?;
-    let buf = BufWriter::with_capacity(1 << 23, file); // 8 MB write buffer
-    Ok(csv::WriterBuilder::new()
-        .has_headers(false)
-        .from_writer(buf))
+    Ok(BufWriter::with_capacity(1 << 23, file)) // 8 MB write buffer
 }
 
 impl Writers {
@@ -568,6 +577,7 @@ fn assign_heights(db: &Connection) -> Result<()> {
 /// is handled by the caller for batching across blocks).
 fn process_block(
     block: &Block,
+    txids: &[bitcoin::Txid],
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
@@ -590,16 +600,16 @@ fn process_block(
     let difficulty_str  = format!("{:.8}", difficulty);
     let (mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) =
         (ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new(), ItoaBuf::new());
-    w.nodes_block.write_record(&[
-        &block_hash, b1.format(height), &prev_hash, &merkle_root_str,
-        &time_str, b2.format(block.txdata.len()), b3.format(block_size),
-        b4.format(block_weight), &bits_hex, &difficulty_str,
-        b5.format(block.header.nonce), b6.format(block.header.version.to_consensus()),
+    write_row(&mut w.nodes_block, &[
+        block_hash.as_bytes(), b1.format(height).as_bytes(), prev_hash.as_bytes(), merkle_root_str.as_bytes(),
+        time_str.as_bytes(), b2.format(block.txdata.len()).as_bytes(), b3.format(block_size).as_bytes(),
+        b4.format(block_weight).as_bytes(), bits_hex.as_bytes(), difficulty_str.as_bytes(),
+        b5.format(block.header.nonce).as_bytes(), b6.format(block.header.version.to_consensus()).as_bytes(),
     ])?;
 
     // NEXT_BLOCK relationship (skip for genesis)
     if let Some(prev) = prev_block_hash {
-        w.rels_next_block.write_record(&[prev, &block_hash])?;
+        write_row(&mut w.rels_next_block, &[prev.as_bytes(), block_hash.as_bytes()])?;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -625,9 +635,8 @@ fn process_block(
     let mut ibuf_rcv = ItoaBuf::new();
 
     let t0 = Instant::now();
-    for tx in &block.txdata {
+    for (tx, txid_obj) in block.txdata.iter().zip(txids.iter()) {
         let t_txid = Instant::now();
-        let txid_obj   = tx.compute_txid();
         let txid       = txid_obj.to_string();      // hex string – for CSV
         let txid_bytes = *txid_obj.as_byte_array(); // 32 raw bytes – for cache
         t.p1_txid += t_txid.elapsed();
@@ -662,16 +671,16 @@ fn process_block(
 
             // Output node (isSpent=false; populated by post_import.cypher)
             let t_wr = Instant::now();
-            w.nodes_output.write_record(&[
+            write_row(&mut w.nodes_output, &[
                 output_id.as_bytes(), ibuf_n.format(n).as_bytes(),
                 ibuf_amt.format(amount).as_bytes(),
                 &script_hex_buf, stype.as_bytes(), b"false", b"", b"",
             ])?;
-            w.rels_has_output.write_record(&[txid.as_bytes(), output_id.as_bytes()])?;
+            write_row(&mut w.rels_has_output, &[txid.as_bytes(), output_id.as_bytes()])?;
 
             if let Some(ref addr) = address {
-                w.nodes_address.write_record(&[addr.as_bytes()])?;
-                w.rels_locked_to.write_record(&[output_id.as_bytes(), addr.as_bytes()])?;
+                write_row(&mut w.nodes_address, &[addr.as_bytes()])?;
+                write_row(&mut w.rels_locked_to, &[output_id.as_bytes(), addr.as_bytes()])?;
                 let e = benefits.entry(addr.clone()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += amount;
@@ -685,7 +694,7 @@ fn process_block(
         // BENEFITS_TO – one relationship per unique recipient address per tx
         let t_wr = Instant::now();
         for (addr, (cnt, received)) in &benefits {
-            w.rels_benefits_to.write_record(&[
+            write_row(&mut w.rels_benefits_to, &[
                 txid.as_bytes(), addr.as_bytes(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_rcv.format(*received).as_bytes(),
             ])?;
@@ -755,12 +764,12 @@ fn process_block(
             script_sig_buf.resize(sig_bytes.len() * 2, 0);
             hex::encode_to_slice(sig_bytes, &mut script_sig_buf).unwrap();
 
-            w.nodes_input.write_record(&[
+            write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
                 &script_sig_buf, ibuf_seq.format(sequence).as_bytes(),
                 witness.as_bytes(),
             ])?;
-            w.rels_has_input.write_record(&[txid.as_bytes(), input_id.as_bytes()])?;
+            write_row(&mut w.rels_has_input, &[txid.as_bytes(), input_id.as_bytes()])?;
             t.n_inputs += 1;
 
             if !is_coinbase {
@@ -773,7 +782,7 @@ fn process_block(
                 use std::fmt::Write as FmtWrite;
                 write!(prev_out_id, "{}:{}", prev_txid, ibuf_pvout.format(prev_vout)).unwrap();
 
-                w.rels_spends.write_record(&[input_id.as_bytes(), prev_out_id.as_bytes()])?;
+                write_row(&mut w.rels_spends, &[input_id.as_bytes(), prev_out_id.as_bytes()])?;
 
                 match utxo_cache.get(&(prev_bytes, prev_vout)) {
                     Some((amt, addr)) => {
@@ -804,7 +813,7 @@ fn process_block(
         let tx_weight = tx.weight().to_wu() as i64;
         let coinbase_str = if is_coinbase { b"true" as &[u8] } else { b"false" };
 
-        w.nodes_transaction.write_record(&[
+        write_row(&mut w.nodes_transaction, &[
             txid.as_bytes(), tb1.format(height).as_bytes(),
             block_hash.as_bytes(), time_str.as_bytes(),
             tb2.format(total_input).as_bytes(), tb3.format(*total_output).as_bytes(),
@@ -814,10 +823,10 @@ fn process_block(
             tb9.format(tx.lock_time.to_consensus_u32()).as_bytes(),
             coinbase_str,
         ])?;
-        w.rels_included_in.write_record(&[txid.as_bytes(), block_hash.as_bytes()])?;
+        write_row(&mut w.rels_included_in, &[txid.as_bytes(), block_hash.as_bytes()])?;
 
         for (addr, (cnt, spent)) in &performs {
-            w.rels_performs.write_record(&[
+            write_row(&mut w.rels_performs, &[
                 addr.as_bytes(), txid.as_bytes(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_spt.format(*spent).as_bytes(),
             ])?;
@@ -1006,9 +1015,13 @@ fn main() -> Result<()> {
             let t_dec = Instant::now();
             let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
                 .with_context(|| format!("decoding block {height}"))
-                .map(|block| BlockMsg {
-                    height, block, hash, read_us,
-                    decode_us: t_dec.elapsed().as_micros() as u64,
+                .map(|block| {
+                    let txids: Vec<_> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+                    BlockMsg {
+                        height, block, hash, read_us,
+                        decode_us: t_dec.elapsed().as_micros() as u64,
+                        txids,
+                    }
                 });
 
             if tx.send(msg).is_err() { break; }
@@ -1018,11 +1031,11 @@ fn main() -> Result<()> {
     db.execute("BEGIN", [])?;
 
     for msg in rx {
-        let BlockMsg { height, block, hash, read_us, decode_us } = msg?;
+        let BlockMsg { height, block, hash, read_us, decode_us, txids } = msg?;
         timings.read   += Duration::from_micros(read_us);
         timings.decode += Duration::from_micros(decode_us);
 
-        process_block(&block, height, prev_block_hash.as_deref(), &mut w,
+        process_block(&block, &txids, height, prev_block_hash.as_deref(), &mut w,
                       &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
