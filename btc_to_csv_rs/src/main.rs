@@ -242,6 +242,7 @@ fn open_utxo_db(path: &Path) -> Result<RocksDB> {
     opts.set_max_write_buffer_number(4);
     opts.set_compression_type(rocksdb::DBCompressionType::None);
     opts.set_level_compaction_dynamic_level_bytes(true);
+    opts.increase_parallelism(16); // use up to 16 cores for compaction/flush
     Ok(RocksDB::open(&opts, path)?)
 }
 
@@ -967,7 +968,9 @@ fn main() -> Result<()> {
     // RocksDB is persistence-only; the in-memory FxHashMap is the live UTXO set.
     print!("  Loading UTXO cache from RocksDB... ");
     io::stdout().flush().ok();
-    let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, Option<String>)> = FxHashMap::default();
+    // Pre-size for ~100M UTXOs (peak mainnet set) to avoid repeated resizing.
+    let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
+        FxHashMap::with_capacity_and_hasher(100_000_000, Default::default());
     for item in utxo_db.iterator(rocksdb::IteratorMode::Start) {
         let (k, v) = item?;
         let txid: [u8; 32] = k[..32].try_into().unwrap();
