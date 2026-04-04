@@ -1065,52 +1065,59 @@ fn main() -> Result<()> {
                 Ok(m) => m,
                 Err(e) => { let _ = tx.send(Err(e)); break; }
             };
-            // Charge the full file read_us to the first block; rest report 0.
-            for (i, (height, byte_offset, block_size, hash)) in blocks.into_iter().enumerate() {
-                let block_read_us = if i == 0 { read_us } else { 0 };
-                let start = byte_offset as usize;
-                let end   = start + block_size as usize;
+            // Decode + precompute all blocks in this file in parallel, then
+            // send them in height order.  Charging the full file read_us to
+            // block i==0 is preserved because par_iter keeps the enumerate index.
+            let decoded: Vec<anyhow::Result<BlockMsg>> = blocks
+                .into_par_iter()
+                .enumerate()
+                .map(|(i, (height, byte_offset, block_size, hash))| {
+                    let block_read_us = if i == 0 { read_us } else { 0 };
+                    let start = byte_offset as usize;
+                    let end   = start + block_size as usize;
 
-                let t_dec = Instant::now();
-                let msg = Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
-                    .with_context(|| format!("decoding block {height}"))
-                    .map(|block| {
-                        let (txids, meta_pairs): (Vec<_>, Vec<(Vec<OutputMeta>, Vec<InputMeta>)>) =
-                            block.txdata.par_iter().map(|tx| {
-                                let txid = tx.compute_txid();
-                                let out_metas = tx.output.iter().map(|txout| {
-                                    let spk = &txout.script_pubkey;
-                                    OutputMeta { stype: script_type(spk), address: script_address(spk) }
-                                }).collect();
-                                let in_metas = tx.input.iter().map(|txin| {
-                                    let witness = encode_witness(&txin.witness);
-                                    let mut bytes = *txin.previous_output.txid.as_byte_array();
-                                    bytes.reverse();
-                                    let mut prev_txid_hex = [0u8; 64];
-                                    hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
-                                    let sig_bytes = txin.script_sig.as_bytes();
-                                    let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
-                                    hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
-                                    InputMeta { witness, prev_txid_hex, script_sig_hex }
-                                }).collect();
-                                (txid, (out_metas, in_metas))
-                            }).unzip();
-                        let txid_hexes: Vec<[u8; 64]> = txids.iter().map(|txid| {
-                            let mut bytes = *txid.as_byte_array();
-                            bytes.reverse();
-                            let mut hex = [0u8; 64];
-                            hex::encode_to_slice(&bytes, &mut hex).unwrap();
-                            hex
-                        }).collect();
-                        let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
-                        BlockMsg {
-                            height, block, hash,
-                            read_us: block_read_us,
-                            decode_us: t_dec.elapsed().as_micros() as u64,
-                            txids, txid_hexes, output_metas, input_metas,
-                        }
-                    });
-
+                    let t_dec = Instant::now();
+                    Block::consensus_decode(&mut std::io::Cursor::new(&contents[start..end]))
+                        .with_context(|| format!("decoding block {height}"))
+                        .map(|block| {
+                            let (txids, meta_pairs): (Vec<_>, Vec<(Vec<OutputMeta>, Vec<InputMeta>)>) =
+                                block.txdata.par_iter().map(|tx| {
+                                    let txid = tx.compute_txid();
+                                    let out_metas = tx.output.iter().map(|txout| {
+                                        let spk = &txout.script_pubkey;
+                                        OutputMeta { stype: script_type(spk), address: script_address(spk) }
+                                    }).collect();
+                                    let in_metas = tx.input.iter().map(|txin| {
+                                        let witness = encode_witness(&txin.witness);
+                                        let mut bytes = *txin.previous_output.txid.as_byte_array();
+                                        bytes.reverse();
+                                        let mut prev_txid_hex = [0u8; 64];
+                                        hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
+                                        let sig_bytes = txin.script_sig.as_bytes();
+                                        let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
+                                        hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
+                                        InputMeta { witness, prev_txid_hex, script_sig_hex }
+                                    }).collect();
+                                    (txid, (out_metas, in_metas))
+                                }).unzip();
+                            let txid_hexes: Vec<[u8; 64]> = txids.iter().map(|txid| {
+                                let mut bytes = *txid.as_byte_array();
+                                bytes.reverse();
+                                let mut hex = [0u8; 64];
+                                hex::encode_to_slice(&bytes, &mut hex).unwrap();
+                                hex
+                            }).collect();
+                            let (output_metas, input_metas) = meta_pairs.into_iter().unzip();
+                            BlockMsg {
+                                height, block, hash,
+                                read_us: block_read_us,
+                                decode_us: t_dec.elapsed().as_micros() as u64,
+                                txids, txid_hexes, output_metas, input_metas,
+                            }
+                        })
+                })
+                .collect();
+            for msg in decoded {
                 if tx.send(msg).is_err() { break; }
             }
         }
