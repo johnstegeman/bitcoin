@@ -80,44 +80,6 @@ struct Args {
     ssd: bool,
 }
 
-// ─── Address intern table ─────────────────────────────────────────────────────
-
-/// Maps address strings ↔ compact u32 IDs to avoid heap-allocating one
-/// String per UTXO in the 100M-entry cache.  id=0 means "no address";
-/// live IDs start at 1.
-struct AddrIntern {
-    strings: Vec<String>,
-    lookup:  FxHashMap<String, u32>,
-}
-
-impl AddrIntern {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            strings: Vec::with_capacity(cap),
-            lookup:  FxHashMap::with_capacity_and_hasher(cap, Default::default()),
-        }
-    }
-
-    /// Intern a string, returning its stable ID (≥1).  Re-uses existing IDs.
-    fn intern(&mut self, addr: String) -> u32 {
-        if let Some(&id) = self.lookup.get(&addr) { return id; }
-        let id = self.strings.len() as u32 + 1;
-        self.lookup.insert(addr.clone(), id);
-        self.strings.push(addr);
-        id
-    }
-
-    /// Intern an Option<String>; None → 0.
-    fn intern_opt(&mut self, addr: Option<String>) -> u32 {
-        match addr { None => 0, Some(a) => self.intern(a) }
-    }
-
-    /// Resolve an ID back to a string slice; id=0 → None.
-    fn get(&self, id: u32) -> Option<&str> {
-        if id == 0 { None } else { Some(&self.strings[(id - 1) as usize]) }
-    }
-}
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAINNET_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
@@ -254,9 +216,9 @@ fn utxo_key(txid: &[u8; 32], vout: u32) -> [u8; 36] {
 }
 
 /// Value: 8-byte little-endian i64 amount || UTF-8 address (absent = None).
-fn utxo_val_encode(amount: i64, addr: Option<&str>) -> Vec<u8> {
+fn utxo_val_encode(amount: i64, addr: &Option<String>) -> Vec<u8> {
     let mut v = amount.to_le_bytes().to_vec();
-    if let Some(a) = addr { v.extend_from_slice(a.as_bytes()); }
+    if let Some(a) = addr.as_deref() { v.extend_from_slice(a.as_bytes()); }
     v
 }
 
@@ -673,10 +635,9 @@ fn process_block(
     height: i64,
     prev_block_hash: Option<&str>,
     w: &mut Writers,
-    pending_inserts: &mut FxHashMap<([u8; 32], u32), (i64, u32)>,
+    pending_inserts: &mut FxHashMap<([u8; 32], u32), (i64, Option<String>)>,
     pending_deletes: &mut FxHashSet<([u8; 32], u32)>,
-    utxo_cache: &mut FxHashMap<([u8; 32], u32), (i64, u32)>,
-    intern: &mut AddrIntern,
+    utxo_cache: &mut FxHashMap<([u8; 32], u32), (i64, Option<String>)>,
     t: &mut Timings,
 ) -> Result<()> {
     let block_hash = block.header.block_hash().to_string();
@@ -715,11 +676,11 @@ fn process_block(
     // (txid_hex, total_output) carried forward to Pass 2
     let mut tx_totals: Vec<([u8; 64], i64)> = Vec::with_capacity(block.txdata.len());
 
-    let mut utxo_inserts: Vec<([u8; 32], u32, i64, u32)> =
+    let mut utxo_inserts: Vec<([u8; 32], u32, i64, Option<String>)> =
         Vec::with_capacity(block.txdata.len() * 2);
 
     // Reusable per-block buffers — avoids one heap allocation per output.
-    let mut benefits: FxHashMap<u32, (i32, i64)> = FxHashMap::default();
+    let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
     let mut output_id    = String::with_capacity(80);  // txid(64) + ':' + vout
     let mut ibuf_n   = ItoaBuf::new();
     let mut ibuf_amt = ItoaBuf::new();
@@ -763,25 +724,22 @@ fn process_block(
             ])?;
             write_row(&mut w.rels_has_output, &[txid_hex.as_ref(), output_id.as_bytes()])?;
 
-            let addr_id = intern.intern_opt(address);
-            if addr_id != 0 {
-                let addr = intern.get(addr_id).unwrap();
+            if let Some(ref addr) = address {
                 write_row(&mut w.nodes_address, &[addr.as_bytes()])?;
                 write_row(&mut w.rels_locked_to, &[output_id.as_bytes(), addr.as_bytes()])?;
-                let e = benefits.entry(addr_id).or_insert((0, 0));
+                let e = benefits.entry(addr.clone()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += amount;
             }
             t.p1_csv_write += t_wr.elapsed();
 
-            utxo_inserts.push((txid_bytes, n as u32, amount, addr_id));
+            utxo_inserts.push((txid_bytes, n as u32, amount, address));
             t.n_outputs += 1;
         }
 
         // BENEFITS_TO – one relationship per unique recipient address per tx
         let t_wr = Instant::now();
-        for (addr_id, (cnt, received)) in &benefits {
-            let addr = intern.get(*addr_id).unwrap();
+        for (addr, (cnt, received)) in &benefits {
             write_row(&mut w.rels_benefits_to, &[
                 txid_hex.as_ref(), addr.as_bytes(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_rcv.format(*received).as_bytes(),
@@ -797,10 +755,10 @@ fn process_block(
     // Actual SQLite writes are deferred to commit time so transient UTXOs
     // (created and spent within the same batch) never touch disk at all.
     let t0 = Instant::now();
-    for (txid_bytes, vout, amount, addr_id) in &utxo_inserts {
+    for (txid_bytes, vout, amount, addr) in &utxo_inserts {
         let key = (*txid_bytes, *vout);
-        pending_inserts.insert(key, (*amount, *addr_id));
-        utxo_cache.insert(key, (*amount, *addr_id));
+        pending_inserts.insert(key, (*amount, addr.clone()));
+        utxo_cache.insert(key, (*amount, addr.clone()));
     }
     t.utxo_insert += t0.elapsed();
 
@@ -813,7 +771,7 @@ fn process_block(
     // ─────────────────────────────────────────────────────────────────────
 
     // Reusable per-block buffers for pass 2 — same pattern as pass 1.
-    let mut performs: FxHashMap<u32, (i32, i64)> = FxHashMap::default();
+    let mut performs: FxHashMap<String, (i32, i64)> = FxHashMap::default();
     let mut input_id      = String::with_capacity(80);
     let mut prev_out_id   = String::with_capacity(80);
     let mut ibuf_idx   = ItoaBuf::new();
@@ -877,10 +835,10 @@ fn process_block(
                 let key = (prev_bytes, prev_vout);
                 let t_ul = Instant::now();
                 match utxo_cache.remove(&key) {
-                    Some((amt, addr_id)) => {
+                    Some((amt, addr)) => {
                         total_input += amt;
-                        if addr_id != 0 {
-                            let e = performs.entry(addr_id).or_insert((0, 0));
+                        if let Some(a) = addr {
+                            let e = performs.entry(a.clone()).or_insert((0, 0));
                             e.0 += 1;
                             e.1 += amt;
                         }
@@ -923,8 +881,7 @@ fn process_block(
         ])?;
         write_row(&mut w.rels_included_in, &[txid_hex.as_ref(), block_hash.as_bytes()])?;
 
-        for (addr_id, (cnt, spent)) in &performs {
-            let addr = intern.get(*addr_id).unwrap();
+        for (addr, (cnt, spent)) in &performs {
             write_row(&mut w.rels_performs, &[
                 addr.as_bytes(), txid_hex.as_ref(),
                 ibuf_cnt.format(*cnt).as_bytes(), ibuf_spt.format(*spent).as_bytes(),
@@ -1023,20 +980,16 @@ fn main() -> Result<()> {
     print!("  Loading UTXO cache from RocksDB... ");
     io::stdout().flush().ok();
     // Pre-size for ~100M UTXOs (peak mainnet set) to avoid repeated resizing.
-    // Values are interned address IDs (u32) instead of Option<String> to keep
-    // the hot map ~20 bytes/entry smaller and eliminate per-UTXO allocations.
-    let mut intern = AddrIntern::with_capacity(40_000_000); // ~30-40M unique addrs on mainnet
-    let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, u32)> =
+    let mut utxo_cache: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
         FxHashMap::with_capacity_and_hasher(100_000_000, Default::default());
     for item in utxo_db.iterator(rocksdb::IteratorMode::Start) {
         let (k, v) = item?;
         let txid: [u8; 32] = k[..32].try_into().unwrap();
         let vout = u32::from_be_bytes(k[32..36].try_into().unwrap());
         let (amount, addr) = utxo_val_decode(&v);
-        let addr_id = intern.intern_opt(addr);
-        utxo_cache.insert((txid, vout), (amount, addr_id));
+        utxo_cache.insert((txid, vout), (amount, addr));
     }
-    println!("{} UTXOs loaded ({} unique addresses interned).", utxo_cache.len(), intern.strings.len());
+    println!("{} UTXOs loaded.", utxo_cache.len());
 
     let total = (end - start + 1).max(1);
     let mut timings = Timings::default();
@@ -1050,7 +1003,7 @@ fn main() -> Result<()> {
     // non-transient subset (~60-70%) = up to ~5.5M entries. Pre-size to 8M
     // to avoid any mid-batch resize (which rehashes all entries).
     // pending_deletes holds the non-transient inputs (~4-5M); pre-size to 8M.
-    let mut pending_inserts: FxHashMap<([u8; 32], u32), (i64, u32)> =
+    let mut pending_inserts: FxHashMap<([u8; 32], u32), (i64, Option<String>)> =
         FxHashMap::with_capacity_and_hasher(batch_cap * 4000, Default::default());
     let mut pending_deletes: FxHashSet<([u8; 32], u32)> =
         FxHashSet::with_capacity_and_hasher(batch_cap * 4000, Default::default());
@@ -1222,7 +1175,7 @@ fn main() -> Result<()> {
         timings.decode += Duration::from_micros(decode_us);
 
         process_block(&block, &txids, &txid_hexes, output_metas, input_metas, height, prev_block_hash.as_deref(), &mut w,
-                      &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut intern, &mut timings)?;
+                      &mut pending_inserts, &mut pending_deletes, &mut utxo_cache, &mut timings)?;
 
         let t0 = Instant::now();
         db.execute("UPDATE checkpoint SET last_height=?1 WHERE id=1", params![height])?;
@@ -1242,8 +1195,8 @@ fn main() -> Result<()> {
 
             let t_rdb0 = Instant::now();
             let mut batch = WriteBatch::default();
-            for ((txid, vout), (amount, addr_id)) in &inserts {
-                batch.put(utxo_key(txid, *vout), utxo_val_encode(*amount, intern.get(*addr_id)));
+            for ((txid, vout), (amount, addr)) in &inserts {
+                batch.put(utxo_key(txid, *vout), utxo_val_encode(*amount, addr));
             }
             for (txid, vout) in &deletes {
                 batch.delete(utxo_key(txid, *vout));
