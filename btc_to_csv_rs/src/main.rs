@@ -552,6 +552,8 @@ fn assign_heights(db: &Connection) -> Result<()> {
     let mut current_hash = GENESIS_HASH.to_string();
     let mut height: i64 = 0;
 
+    db.execute_batch("BEGIN")?;
+
     let mut set_height = db.prepare(
         "UPDATE block_idx SET height = ?1 WHERE hash = ?2"
     )?;
@@ -582,6 +584,10 @@ fn assign_heights(db: &Connection) -> Result<()> {
             None => break, // reached chain tip
         }
     }
+
+    drop(set_height);
+    drop(next_stmt);
+    db.execute_batch("COMMIT")?;
 
     Ok(())
 }
