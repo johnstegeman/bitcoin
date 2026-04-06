@@ -157,15 +157,6 @@ fn script_address(script: &bitcoin::Script) -> Option<String> {
     None
 }
 
-/// Encode witness stack items as semicolon-separated hex strings
-/// (Neo4j admin import uses `;` as default array delimiter for `string[]`).
-fn encode_witness(witness: &bitcoin::Witness) -> String {
-    witness
-        .iter()
-        .map(hex::encode)
-        .collect::<Vec<_>>()
-        .join(";")
-}
 
 /// Difficulty from compact `bits` target encoding.
 fn bits_to_difficulty(bits: u32) -> f64 {
@@ -260,7 +251,6 @@ struct OutputMeta {
 }
 
 struct InputMeta {
-    witness:       String,   // semicolon-separated hex witness items (pre-encoded)
     prev_txid_hex: [u8; 64], // display-order ASCII hex of prev txid (no allocation)
     script_sig_hex: Vec<u8>, // hex-encoded scriptSig bytes (pre-encoded, variable length)
 }
@@ -297,8 +287,7 @@ const HEADERS: &[(&str, &[&str])] = &[
         "isSpent:boolean", "spentInTxid:string", "spentAtHeight:int",
     ]),
     ("nodes_input", &[
-        "inputId:ID(Input)", "inputIndex:int", "scriptSig:string",
-        "sequence:long", "witness:string[]",
+        "inputId:ID(Input)", "inputIndex:int", "scriptSig:string", "sequence:long",
     ]),
     ("nodes_address", &["address:ID(Address)"]),
     // Relationships
@@ -783,7 +772,6 @@ fn process_block(
 
         for ((idx, txin), meta) in tx.input.iter().enumerate().zip(tx_in_metas.into_iter()) {
             let sequence  = txin.sequence.0 as i64;
-            let witness   = meta.witness;
             let prev_bytes = *txin.previous_output.txid.as_byte_array();
             let prev_vout  = txin.previous_output.vout;
 
@@ -807,7 +795,6 @@ fn process_block(
             write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
                 &meta.script_sig_hex, ibuf_seq.format(sequence).as_bytes(),
-                witness.as_bytes(),
             ])?;
             write_row(&mut w.rels_has_input, &[txid_hex.as_ref(), input_id.as_bytes()])?;
             if !is_coinbase {
@@ -1127,7 +1114,6 @@ fn main() -> Result<()> {
                                     OutputMeta { stype: script_type(spk), address: script_address(spk) }
                                 }).collect();
                                 let in_metas = tx.input.iter().map(|txin| {
-                                    let witness = encode_witness(&txin.witness);
                                     let mut bytes = *txin.previous_output.txid.as_byte_array();
                                     bytes.reverse();
                                     let mut prev_txid_hex = [0u8; 64];
@@ -1135,7 +1121,7 @@ fn main() -> Result<()> {
                                     let sig_bytes = txin.script_sig.as_bytes();
                                     let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
                                     hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
-                                    InputMeta { witness, prev_txid_hex, script_sig_hex }
+                                    InputMeta { prev_txid_hex, script_sig_hex }
                                 }).collect();
                                 (txid, (out_metas, in_metas))
                             }).unzip();
