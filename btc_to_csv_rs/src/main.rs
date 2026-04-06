@@ -501,85 +501,103 @@ impl Timings {
 
 // ─── Phase 1: Block file indexing ─────────────────────────────────────────────
 
-/// Scan all blk*.dat files and populate block_idx in SQLite.
+/// A single row to be inserted into block_idx.
+struct BlockIdxRow {
+    hash:        String,
+    prev_hash:   String,
+    file_path:   String,
+    byte_offset: i64,
+    block_size:  i64,
+}
+
+/// Scan one blk*.dat file and return all its block index rows.
+fn scan_blk_file(path: &PathBuf, ssd: bool) -> Result<Vec<BlockIdxRow>> {
+    let file_str = path.to_string_lossy().to_string();
+    let mut f = BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut rows: Vec<BlockIdxRow> = Vec::new();
+    let mut file_offset: u64 = 0;
+
+    loop {
+        let mut magic = [0u8; 4];
+        match f.read_exact(&mut magic) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+            Ok(()) => {}
+        }
+        file_offset += 4;
+
+        if magic == [0u8; 4] { break; }
+        if magic != MAINNET_MAGIC {
+            eprintln!("  WARN {}: unexpected magic {:?} at offset {}, skipping",
+                      path.display(), magic, file_offset - 4);
+            break;
+        }
+
+        let mut size_buf = [0u8; 4];
+        f.read_exact(&mut size_buf)?;
+        file_offset += 4;
+        let block_size = u32::from_le_bytes(size_buf) as u64;
+
+        let block_data_offset = file_offset;
+
+        let mut header_buf = [0u8; 80];
+        f.read_exact(&mut header_buf)?;
+
+        let header = BlockHeader::consensus_decode(&mut std::io::Cursor::new(&header_buf))
+            .with_context(|| format!("{}: header parse failed at offset {}",
+                                     path.display(), block_data_offset))?;
+
+        rows.push(BlockIdxRow {
+            hash:        header.block_hash().to_string(),
+            prev_hash:   header.prev_blockhash.to_string(),
+            file_path:   file_str.clone(),
+            byte_offset: block_data_offset as i64,
+            block_size:  block_size as i64,
+        });
+
+        let remaining = block_size.saturating_sub(80);
+        if ssd {
+            f.seek(io::SeekFrom::Current(remaining as i64))?;
+        } else {
+            io::copy(&mut f.by_ref().take(remaining), &mut io::sink())?;
+        }
+        file_offset += block_size;
+    }
+    Ok(rows)
+}
+
+/// Scan all blk*.dat files in parallel and populate block_idx in SQLite.
 /// Uses INSERT OR IGNORE so re-running is safe (idempotent).
 fn index_block_files(files: &[PathBuf], db: &Connection, ssd: bool) -> Result<()> {
-    println!("Phase 1: indexing {} blk*.dat file(s)…", files.len());
+    println!("Phase 1: scanning {} blk*.dat file(s) in parallel…", files.len());
 
+    // Parallel scan — SQLite Connection is not Send, so we collect first.
+    let scan_results: Vec<Result<Vec<BlockIdxRow>>> =
+        files.par_iter().map(|p| scan_blk_file(p, ssd)).collect();
+
+    // Check for errors and flatten into one big vec.
+    let mut all_rows: Vec<BlockIdxRow> = Vec::with_capacity(1_000_000);
+    for r in scan_results {
+        all_rows.extend(r?);
+    }
+    println!("  Scanned {} blocks across {} files. Inserting into index…",
+             all_rows.len(), files.len());
+
+    // Single transaction for all inserts — orders of magnitude faster than
+    // per-row or per-file commits.
     let mut insert = db.prepare(
         "INSERT OR IGNORE INTO block_idx (hash, prev_hash, file_path, byte_offset, block_size)
          VALUES (?1, ?2, ?3, ?4, ?5)"
     )?;
-
-    for (file_no, path) in files.iter().enumerate() {
-        let file_str = path.to_string_lossy().to_string();
-        let mut f = BufReader::with_capacity(1 << 20, File::open(path)?);
-        let mut blocks_in_file = 0u64;
-        let mut file_offset: u64 = 0;
-
-        // Wrap each file's inserts in a transaction — avoids 941k auto-commits.
-        db.execute_batch("BEGIN")?;
-
-        loop {
-            // Read magic (4 bytes)
-            let mut magic = [0u8; 4];
-            match f.read_exact(&mut magic) {
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-                Ok(()) => {}
-            }
-            file_offset += 4;
-
-            // Zero-padding at end of file → stop
-            if magic == [0u8; 4] {
-                break;
-            }
-            if magic != MAINNET_MAGIC {
-                eprintln!("  WARN {}: unexpected magic {:?} at offset {}, skipping",
-                          path.display(), magic, file_offset - 4);
-                break;
-            }
-
-            // Read block size (4 bytes, little-endian)
-            let mut size_buf = [0u8; 4];
-            f.read_exact(&mut size_buf)?;
-            file_offset += 4;
-            let block_size = u32::from_le_bytes(size_buf) as u64;
-
-            // byte_offset is where the raw block data starts (after magic+size)
-            let block_data_offset = file_offset;
-
-            // Parse just the 80-byte block header (fast path)
-            let mut header_buf = [0u8; 80];
-            f.read_exact(&mut header_buf)?;
-
-            let header = BlockHeader::consensus_decode(&mut std::io::Cursor::new(&header_buf))
-                .with_context(|| format!("{}: header parse failed at offset {}", path.display(), block_data_offset))?;
-
-            let block_hash   = header.block_hash().to_string();
-            let prev_hash    = header.prev_blockhash.to_string();
-
-            insert.execute(params![block_hash, prev_hash, &file_str, block_data_offset as i64, block_size as i64])?;
-
-            // Skip the rest of the block (we already read 80 bytes of it).
-            // SSD: lseek is essentially free — no data read.
-            // HDD: read-to-sink keeps the sequential access pattern intact.
-            let remaining = block_size.saturating_sub(80);
-            if ssd {
-                f.seek(io::SeekFrom::Current(remaining as i64))?;
-            } else {
-                io::copy(&mut f.by_ref().take(remaining), &mut io::sink())?;
-            }
-            file_offset += block_size;
-            blocks_in_file += 1;
-        }
-
-        db.execute_batch("COMMIT")?;
-        println!("  [{}/{}] {} — {} blocks", file_no + 1, files.len(),
-                 path.file_name().unwrap().to_string_lossy(), blocks_in_file);
+    db.execute_batch("BEGIN")?;
+    for row in &all_rows {
+        insert.execute(params![
+            &row.hash, &row.prev_hash, &row.file_path,
+            row.byte_offset, row.block_size
+        ])?;
     }
+    db.execute_batch("COMMIT")?;
 
-    // Assign heights by following the chain from genesis
     println!("  Assigning chain heights from genesis…");
     assign_heights(db)?;
 
