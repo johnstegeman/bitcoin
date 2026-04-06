@@ -252,7 +252,6 @@ struct OutputMeta {
 
 struct InputMeta {
     prev_txid_hex: [u8; 64], // display-order ASCII hex of prev txid (no allocation)
-    script_sig_hex: Vec<u8>, // hex-encoded scriptSig bytes (pre-encoded, variable length)
 }
 
 struct BlockMsg {
@@ -283,11 +282,11 @@ const HEADERS: &[(&str, &[&str])] = &[
     ]),
     ("nodes_output", &[
         "outputId:ID(Output)", "outputIndex:int", "amount:long",
-        "scriptPubKey:string", "scriptType:string",
+        "scriptType:string",
         "isSpent:boolean", "spentInTxid:string", "spentAtHeight:int",
     ]),
     ("nodes_input", &[
-        "inputId:ID(Input)", "inputIndex:int", "scriptSig:string", "sequence:long",
+        "inputId:ID(Input)", "inputIndex:int", "sequence:long",
     ]),
     ("nodes_address", &["address:ID(Address)"]),
     // Relationships
@@ -649,7 +648,6 @@ fn process_block(
     // Reusable per-block buffers — avoids one heap allocation per output.
     let mut benefits: FxHashMap<String, (i32, i64)> = FxHashMap::default();
     let mut output_id    = String::with_capacity(80);  // txid(64) + ':' + vout
-    let mut script_hex_buf: Vec<u8> = Vec::with_capacity(202); // 101-byte script * 2
     let mut ibuf_n   = ItoaBuf::new();
     let mut ibuf_amt = ItoaBuf::new();
     let mut ibuf_cnt = ItoaBuf::new();
@@ -672,7 +670,6 @@ fn process_block(
 
         for ((n, txout), meta) in tx.output.iter().enumerate().zip(tx_metas.into_iter()) {
             let amount  = txout.value.to_sat() as i64;
-            let spk     = &txout.script_pubkey;
             let stype   = meta.stype;
             let address = meta.address;
 
@@ -684,19 +681,12 @@ fn process_block(
             output_id.push(':');
             output_id.push_str(ibuf_n.format(n));
 
-            // Hex-encode script into reusable buffer (no allocation)
-            let t_hex = Instant::now();
-            let spk_bytes = spk.as_bytes();
-            script_hex_buf.resize(spk_bytes.len() * 2, 0);
-            hex::encode_to_slice(spk_bytes, &mut script_hex_buf).unwrap();
-            t.p1_hex += t_hex.elapsed();
-
             // Output node (isSpent=false; populated by post_import.cypher)
             let t_wr = Instant::now();
             write_row(&mut w.nodes_output, &[
                 output_id.as_bytes(), ibuf_n.format(n).as_bytes(),
                 ibuf_amt.format(amount).as_bytes(),
-                &script_hex_buf, stype.as_bytes(), b"false", b"", b"",
+                stype.as_bytes(), b"false", b"", b"",
             ])?;
             write_row(&mut w.rels_has_output, &[txid_hex.as_ref(), output_id.as_bytes()])?;
 
@@ -794,7 +784,7 @@ fn process_block(
             let t_wr = Instant::now();
             write_row(&mut w.nodes_input, &[
                 input_id.as_bytes(), ibuf_idx.format(idx).as_bytes(),
-                &meta.script_sig_hex, ibuf_seq.format(sequence).as_bytes(),
+                ibuf_seq.format(sequence).as_bytes(),
             ])?;
             write_row(&mut w.rels_has_input, &[txid_hex.as_ref(), input_id.as_bytes()])?;
             if !is_coinbase {
@@ -1118,10 +1108,7 @@ fn main() -> Result<()> {
                                     bytes.reverse();
                                     let mut prev_txid_hex = [0u8; 64];
                                     hex::encode_to_slice(&bytes, &mut prev_txid_hex).unwrap();
-                                    let sig_bytes = txin.script_sig.as_bytes();
-                                    let mut script_sig_hex = vec![0u8; sig_bytes.len() * 2];
-                                    hex::encode_to_slice(sig_bytes, &mut script_sig_hex).unwrap();
-                                    InputMeta { prev_txid_hex, script_sig_hex }
+                                    InputMeta { prev_txid_hex }
                                 }).collect();
                                 (txid, (out_metas, in_metas))
                             }).unzip();
