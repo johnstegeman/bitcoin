@@ -686,7 +686,7 @@ fn process_block(
             write_row(&mut w.nodes_output, &[
                 output_id.as_bytes(), ibuf_n.format(n).as_bytes(),
                 ibuf_amt.format(amount).as_bytes(),
-                stype.as_bytes(), b"false", b"", b"",
+                stype.as_bytes(), b"false", b"", b"-1",
             ])?;
             write_row(&mut w.rels_has_output, &[txid_hex.as_ref(), output_id.as_bytes()])?;
 

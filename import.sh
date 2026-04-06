@@ -33,7 +33,7 @@ neo4j-admin database import full \
   --relationships=BENEFITS_TO="$CSV_DIR/rels_benefits_to-header.csv,$CSV_DIR/rels_benefits_to.csv" \
   --ignore-duplicate-nodes=true \
   --id-type=STRING \
-  --overwrite-destination=true \
+  --overwrite-destination \
   "$DB"
 
 echo ""
